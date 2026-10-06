@@ -18,6 +18,17 @@ st.markdown("""
 
 COLUNAS_NOTAS = ["AP1/AV1", "AP2/AV2", "TE", "AE", "ND", "TOTAL PARCIAL", "FINAL"]
 
+# Sinônimos aceitos para cada coluna (normalizados, sem espaços)
+ALIASES_NOTAS = {
+    "AP1/AV1":       ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1"],
+    "AP2/AV2":       ["AP2/AV2", "AV2/AP2", "AP2AV2", "AV2AP2", "AP2/AS", "AP2AS"],
+    "TE":            ["TE"],
+    "AE":            ["AE"],
+    "ND":            ["ND"],
+    "TOTAL PARCIAL": ["TOTALPARCIAL"],
+    "FINAL":         ["FINAL"],
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,6 +39,18 @@ def normalizar(s):
     s = str(s).upper().strip()
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
     s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalizar_header(s):
+    """Normaliza cabeçalhos de PDF: remove acentos, hífens, quebras de linha."""
+    if s is None:
+        return ""
+    s = str(s).upper()
+    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
+    # Remove tudo que não seja letra, número, "/" ou espaço
+    s = re.sub(r"[^A-Z0-9/ ]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -54,7 +77,21 @@ def valor_em_branco(valor):
         return False
 
 
+def mapear_colunas_notas(header_list):
+    """Retorna {nome_logico: indice} a partir da lista de cabeçalhos."""
+    norm = [normalizar_header(h).replace(" ", "") for h in header_list]
+    indices = {}
+    for nome_logico, variantes in ALIASES_NOTAS.items():
+        variantes_norm = [v.replace(" ", "") for v in variantes]
+        for i, h in enumerate(norm):
+            if h in variantes_norm:
+                indices[nome_logico] = i
+                break
+    return indices
+
+
 def extrair_tabela_notas(df_bruto):
+    # Linhas de alunos: primeira célula é o número de chamada (1 a 3 dígitos)
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
         primeira = str(row.iloc[0]).strip()
@@ -65,8 +102,18 @@ def extrair_tabela_notas(df_bruto):
         return None
 
     n_cols = df_bruto.shape[1]
-    if n_cols < 9:
+    if n_cols < 4:
         return None
+
+    # 1) tenta localizar as colunas pelo cabeçalho
+    indices = mapear_colunas_notas(list(df_bruto.columns))
+
+    # 2) fallback: usa a primeira linha do DataFrame como cabeçalho
+    if "AE" not in indices:
+        indices = mapear_colunas_notas(list(df_bruto.iloc[0]))
+
+    # 3) último recurso: posição fixa (últimas 7 colunas) — mantém compatibilidade
+    usar_posicao_fixa = "AE" not in indices
 
     registros = []
     for row in linhas_alunos:
@@ -74,18 +121,28 @@ def extrair_tabela_notas(df_bruto):
         nome = str(row.iloc[2]).strip()
         if not matricula:
             continue
-        notas = row.iloc[n_cols - 7:n_cols].tolist()
+
         reg = {"MATRICULA": matricula, "NOME": nome}
-        for nome_col, val in zip(COLUNAS_NOTAS, notas):
-            reg[nome_col] = val
+
+        if usar_posicao_fixa:
+            notas = row.iloc[n_cols - 7:n_cols].tolist()
+            for nome_col, val in zip(COLUNAS_NOTAS, notas):
+                reg[nome_col] = val
+        else:
+            for nome_logico in COLUNAS_NOTAS:
+                idx = indices.get(nome_logico)
+                reg[nome_logico] = row.iloc[idx] if idx is not None else ""
+
         registros.append(reg)
 
     return pd.DataFrame(registros) if registros else None
 
 
 def eh_tabela_de_notas(df_bruto):
-    texto = " ".join(df_bruto.astype(str).values.flatten()).upper()
-    return "AV1/AP1" in texto or "AP1/AV1" in texto
+    header_norm = [normalizar_header(c).replace(" ", "") for c in df_bruto.columns]
+    tem_ae = any(h == "AE" for h in header_norm)
+    tem_nota = any("AP1" in h or "AV1" in h for h in header_norm)
+    return tem_ae and tem_nota
 
 
 @st.cache_data(show_spinner=False)
@@ -120,7 +177,6 @@ def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
 
     ws = writer.sheets[sheet_name]
 
-    # Descobre o índice da coluna (1-based) pelo cabeçalho
     header = [c.value for c in ws[1]]
     if coluna_status not in header:
         return
@@ -147,7 +203,6 @@ def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
         elif v == "":
             cell.fill = cinza
 
-    # Auto-ajuste da largura
     for col in ws.columns:
         max_len = max((len(str(c.value)) if c.value else 0) for c in col)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
@@ -159,7 +214,6 @@ def gerar_planilha_modelo() -> bytes:
         "Matrícula", "Nome do Aluno", "Turma", "Etapa",
         "1ª Disciplina", "2ª Disciplina", "3ª Disciplina", "4ª Disciplina",
     ])
-    # Linha de exemplo
     modelo.loc[0] = ["000000", "AAAAA AAAAA AAAAA", "12101", "2",
                      "019 - CIENCIAS", "009 - GEOGRAFIA",
                      "276 - LIN.PORTUGUESA 2", ""]
@@ -218,7 +272,6 @@ with col_txt:
         """
     )
 
-# Botão para baixar planilha-modelo
 st.download_button(
     label="📄 Baixar planilha-modelo (.xlsx)",
     data=gerar_planilha_modelo(),
@@ -587,11 +640,9 @@ if st.button("▶️ Rodar verificação", type="primary"):
     # ------------------------------------------------------------------
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        # Aba 1 — todas as turmas (formato longo)
         df_long.to_excel(writer, sheet_name="Todas as Turmas", index=False)
         aplicar_formatacao_excel(writer, "Todas as Turmas", "Lançou a Nota?")
 
-        # Aba por turma (formato largo)
         for turma in sorted(df_wide["Turma"].unique()):
             grupo = df_wide[df_wide["Turma"] == turma].copy()
             sheet_name = f"Turma {turma}"[:31]
