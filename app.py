@@ -153,10 +153,81 @@ def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
 
 
+def gerar_planilha_modelo() -> bytes:
+    """Gera um .xlsx em branco com as colunas corretas."""
+    modelo = pd.DataFrame(columns=[
+        "Matrícula", "Nome do Aluno", "Turma", "Etapa",
+        "1ª Disciplina", "2ª Disciplina", "3ª Disciplina", "4ª Disciplina",
+    ])
+    # Linha de exemplo
+    modelo.loc[0] = ["000000", "AAAAA AAAAA AAAAA", "12101", "2",
+                     "019 - CIENCIAS", "009 - GEOGRAFIA",
+                     "276 - LIN.PORTUGUESA 2", ""]
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        modelo.to_excel(writer, sheet_name="Lista de Solicitação", index=False)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # ETAPA 1 — Upload da planilha
 # ---------------------------------------------------------------------------
 st.header("1️⃣ Lista de solicitações")
+
+st.warning(
+    "⚠️ **ATENÇÃO** — A planilha deve conter **SOMENTE** as colunas do modelo abaixo.\n\n"
+    "Colunas extras (filtros, observações, notas antigas, 'Disciplina anterior', etc.) "
+    "podem atrapalhar a varredura."
+)
+
+col_img, col_txt = st.columns([3, 2])
+
+with col_img:
+    caminho_imagem = "assets/template_solicitacoes.png"
+    if os.path.exists(caminho_imagem):
+        st.image(caminho_imagem, caption="Modelo correto da planilha",
+                 use_container_width=True)
+    else:
+        st.markdown("**Modelo correto (exemplo):**")
+        df_exemplo = pd.DataFrame({
+            "Matrícula": ["000000", "111111"],
+            "Nome do Aluno": ["AAAAA AAAAA AAAAA", "BBBBB BBBBB BBBBB"],
+            "Turma": ["12101", "12102"],
+            "Etapa": ["2", "2"],
+            "1ª Disciplina": ["019 - CIENCIAS", "017 - MATEMATICA"],
+            "2ª Disciplina": ["009 - GEOGRAFIA", "009 - GEOGRAFIA"],
+            "3ª Disciplina": ["276 - LIN.PORTUGUESA 2", ""],
+            "4ª Disciplina": ["", ""],
+        })
+        st.dataframe(df_exemplo, hide_index=True, use_container_width=True)
+
+with col_txt:
+    st.markdown(
+        """
+        **Colunas obrigatórias:**
+        - `Matrícula`
+        - `Nome do Aluno`
+        - `Turma`
+        - `Etapa`
+        - Pelo menos uma coluna de disciplina (`1ª Disciplina`, `2ª Disciplina`, ...)
+
+        **Formato da disciplina:** `código - NOME` (ex.: `017 - MATEMATICA`)
+
+        **Remova da planilha** qualquer coluna que não esteja no modelo —
+        inclusive filtros e colunas em branco no final.
+        """
+    )
+
+# Botão para baixar planilha-modelo
+st.download_button(
+    label="📄 Baixar planilha-modelo (.xlsx)",
+    data=gerar_planilha_modelo(),
+    file_name="modelo_solicitacoes_avaliacao_especial.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.markdown("---")
+
 uploaded_excel = st.file_uploader(
     "Envie o arquivo Excel com as solicitações", type=["xlsx"], key="excel"
 )
@@ -167,8 +238,65 @@ if not uploaded_excel:
 
 excel_hash = hashlib.md5(uploaded_excel.getvalue()).hexdigest()[:8]
 df_excel = pd.read_excel(uploaded_excel)
-disc_cols = [c for c in df_excel.columns if "Disciplina" in str(c)]
 
+# ---------------------------------------------------------------------------
+# Validação das colunas
+# ---------------------------------------------------------------------------
+colunas_obrigatorias = ["Matrícula", "Nome do Aluno", "Turma", "Etapa"]
+colunas_presentes = [str(c).strip() for c in df_excel.columns]
+
+faltando_obrig = [c for c in colunas_obrigatorias if c not in colunas_presentes]
+
+padrao_disc = re.compile(r"^\s*[1-4]ª\s*Disciplina\s*$", re.IGNORECASE)
+disc_cols = [c for c in df_excel.columns if padrao_disc.match(str(c))]
+
+colunas_disc_extra = [
+    c for c in df_excel.columns
+    if "Disciplina" in str(c) and not padrao_disc.match(str(c))
+]
+
+colunas_permitidas = set(colunas_obrigatorias) | set(disc_cols) | set(colunas_disc_extra)
+colunas_extras = [c for c in df_excel.columns if c not in colunas_permitidas]
+
+if faltando_obrig:
+    st.error(
+        f"❌ A planilha está sem as colunas obrigatórias: "
+        f"**{', '.join(faltando_obrig)}**. "
+        "Corrija o arquivo e envie novamente."
+    )
+    st.stop()
+
+if not disc_cols:
+    st.error(
+        "❌ Nenhuma coluna de disciplina encontrada. "
+        "A planilha precisa ter pelo menos **1ª Disciplina**, **2ª Disciplina**, etc."
+    )
+    st.stop()
+
+if colunas_disc_extra:
+    st.error(
+        f"❌ Foram encontradas colunas de disciplina fora do padrão: "
+        f"**{', '.join(map(str, colunas_disc_extra))}**. "
+        "Use apenas **1ª Disciplina** até **4ª Disciplina**. "
+        "Corrija o arquivo e envie novamente."
+    )
+    st.stop()
+
+if colunas_extras:
+    st.warning(
+        f"⚠️ A planilha contém colunas extras que serão ignoradas: "
+        f"**{', '.join(map(str, colunas_extras))}**. "
+        "Recomendo removê-las para evitar confusão."
+    )
+
+st.success(
+    f"✅ Planilha validada — colunas de disciplina detectadas: "
+    f"**{', '.join(map(str, disc_cols))}**"
+)
+
+# ---------------------------------------------------------------------------
+# Monta lista de solicitações
+# ---------------------------------------------------------------------------
 solicitacoes = []
 for _, row in df_excel.iterrows():
     matricula = normalizar_codigo(row.get("Matrícula"))
