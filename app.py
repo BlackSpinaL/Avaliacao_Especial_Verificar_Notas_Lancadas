@@ -18,13 +18,13 @@ st.markdown("""
 
 COLUNAS_NOTAS = ["AP1/AV1", "AP2/AV2", "TE", "AE", "ND", "TOTAL PARCIAL", "FINAL"]
 
-# Sinônimos aceitos (já normalizados, sem espaços)
 ALIASES_NOTAS = {
     "AP1/AV1":       ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1"],
-    "AP2/AV2":       ["AP2/AV2", "AV2/AP2", "AP2AV2", "AV2AP2", "AP2/AS", "AP2AS"],
+    "AP2/AV2":       ["AP2/AV2", "AV2/AP2", "AP2AV2", "AV2AP2",
+                      "AP2/AS", "AP2AS", "AS/AP2"],
     "TE":            ["TE"],
-    "AE":            ["AE"],
-    "ND":            ["ND"],
+    "AE":            ["AE", "A E"],
+    "ND":            ["ND", "N D"],
     "TOTAL PARCIAL": ["TOTALPARCIAL"],
     "FINAL":         ["FINAL"],
 }
@@ -49,7 +49,7 @@ def normalizar_header(s):
         return ""
     s = str(s).upper()
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
-    s = re.sub(r"[^A-Z0-9/ ]", " ", s)     # mantém letras, números e "/"
+    s = re.sub(r"[^A-Z0-9/ ]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -77,7 +77,6 @@ def valor_em_branco(valor):
 
 
 def _indice_coluna_por_alias(header_cells, variantes_norm):
-    """Procura, em uma lista de cabeçalhos, o índice que casa com algum alias."""
     for i, h in enumerate(header_cells):
         h_norm = normalizar_header(h).replace(" ", "")
         if h_norm in variantes_norm:
@@ -87,27 +86,32 @@ def _indice_coluna_por_alias(header_cells, variantes_norm):
 
 def localizar_colunas_notas(df_bruto):
     """
-    Procura as colunas de notas varrendo as PRIMEIRAS linhas do DataFrame
-    extraído (o diário pode ter 1 ou 2 linhas de cabeçalho).
-    Retorna dict {nome_logico: indice} ou {} se não achar nada.
+    Procura as colunas de notas varrendo até as 5 primeiras linhas do
+    DataFrame extraído. Retorna dict {nome_logico: indice}.
     """
-    candidatos = []
-    for r in range(min(3, len(df_bruto))):
-        candidatos.append(list(df_bruto.iloc[r]))
-    candidatos.append(list(df_bruto.columns))
-
     melhor = {}
-    for linha in candidatos:
+    for r in range(min(5, len(df_bruto))):
+        linha = list(df_bruto.iloc[r])
         achados = {}
         for nome_logico, variantes in ALIASES_NOTAS.items():
             variantes_norm = [v.replace(" ", "") for v in variantes]
             idx = _indice_coluna_por_alias(linha, variantes_norm)
             if idx is not None:
                 achados[nome_logico] = idx
-        if "AE" in achados and ("AP1/AV1" in achados or "AP2/AV2" in achados):
+        if "AE" in achados and len(achados) >= 2:
             return achados
         if len(achados) > len(melhor):
             melhor = achados
+
+    # tenta também nos nomes das colunas do DataFrame
+    achados = {}
+    for nome_logico, variantes in ALIASES_NOTAS.items():
+        variantes_norm = [v.replace(" ", "") for v in variantes]
+        idx = _indice_coluna_por_alias(list(df_bruto.columns), variantes_norm)
+        if idx is not None:
+            achados[nome_logico] = idx
+    if "AE" in achados and len(achados) >= 2:
+        return achados
 
     return melhor
 
@@ -128,6 +132,7 @@ def extrair_tabela_notas(df_bruto):
         return None
 
     indices = localizar_colunas_notas(df_bruto)
+    usar_header = ("AE" in indices)
 
     registros = []
     for row in linhas_alunos:
@@ -138,11 +143,12 @@ def extrair_tabela_notas(df_bruto):
 
         reg = {"MATRICULA": matricula, "NOME": nome}
 
-        if indices.get("AE") is not None:
+        if usar_header:
             for nome_logico in COLUNAS_NOTAS:
                 idx = indices.get(nome_logico)
                 reg[nome_logico] = row.iloc[idx] if idx is not None else ""
         else:
+            # fallback: assume as últimas 7 colunas como notas
             notas = row.iloc[n_cols - 7:n_cols].tolist()
             for nome_col, val in zip(COLUNAS_NOTAS, notas):
                 reg[nome_col] = val
@@ -153,47 +159,46 @@ def extrair_tabela_notas(df_bruto):
 
 
 def eh_tabela_de_notas(df_bruto):
-    """Verifica se a tabela extraída parece ser a de notas (tem AE e algum AP)."""
-    indices = localizar_colunas_notas(df_bruto)
-    return "AE" in indices and ("AP1/AV1" in indices or "AP2/AV2" in indices)
+    """Verifica se a tabela parece ser o diário de notas (procura marcadores)."""
+    texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
+    texto_norm = re.sub(r"\s+", "", texto)
+    marcadores = ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1",
+                  "AP2/AS", "AP2/AV2", "TOTALPARCIAL"]
+    return sum(1 for m in marcadores if m in texto_norm) >= 2
 
 
 @st.cache_data(show_spinner=False)
 def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
-    """Lê o PDF tentando primeiro lattice (com grades) e caindo para stream."""
+    """Tenta stream e lattice, e devolve o resultado com mais alunos."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
     try:
-        tabelas = []
-
-        # 1) tenta lattice (diários com bordas bem definidas)
-        try:
-            tabelas = camelot.read_pdf(tmp_path, pages="all", flavor="lattice")
-        except Exception:
-            tabelas = []
-
-        # 2) se não achou nada útil, tenta stream
-        if not any(eh_tabela_de_notas(t.df) for t in tabelas):
+        tentativas = [
+            ("stream",  {"flavor": "stream",  "strip_text": "\n"}),
+            ("lattice", {"flavor": "lattice"}),
+        ]
+        resultados = {}
+        for nome_flavor, kwargs in tentativas:
             try:
-                tabelas_stream = camelot.read_pdf(
-                    tmp_path, pages="all", flavor="stream", strip_text="\n"
-                )
-                tabelas = list(tabelas) + list(tabelas_stream)
+                tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
             except Exception:
-                pass
+                continue
+            notas = {}
+            for t in tabs:
+                if not eh_tabela_de_notas(t.df):
+                    continue
+                df = extrair_tabela_notas(t.df)
+                if df is None:
+                    continue
+                for _, row in df.iterrows():
+                    notas[row["MATRICULA"]] = row.to_dict()
+            resultados[nome_flavor] = notas
 
-        notas = {}
-        for t in tabelas:
-            if not eh_tabela_de_notas(t.df):
-                continue
-            df = extrair_tabela_notas(t.df)
-            if df is None:
-                continue
-            for _, row in df.iterrows():
-                notas[row["MATRICULA"]] = row.to_dict()
-        return notas
+        if not resultados:
+            return {}
+        return max(resultados.values(), key=len)
     finally:
         try:
             os.unlink(tmp_path)
@@ -203,19 +208,19 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
 
 @st.cache_data(show_spinner=False)
 def depurar_pdf(pdf_bytes: bytes):
-    """
-    Roda ambos os flavors e devolve, para inspeção, os cabeçalhos detectados
-    e o mapeamento de colunas de notas encontrado.
-    """
+    """Devolve informações de debug para inspeção."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
     try:
         resultado = {}
-        for flavor in ("lattice", "stream"):
+        for flavor in ("stream", "lattice"):
+            kwargs = {"flavor": flavor}
+            if flavor == "stream":
+                kwargs["strip_text"] = "\n"
             try:
-                tabs = camelot.read_pdf(tmp_path, pages="all", flavor=flavor)
+                tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
             except Exception as e:
                 resultado[flavor] = {"erro": str(e), "tabelas": []}
                 continue
@@ -242,11 +247,9 @@ def depurar_pdf(pdf_bytes: bytes):
 
 
 def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
-    """Aplica cores condicionais Sim/Não/Diário não enviado na coluna indicada."""
     from openpyxl.styles import PatternFill, Font
 
     ws = writer.sheets[sheet_name]
-
     header = [c.value for c in ws[1]]
     if coluna_status not in header:
         return
@@ -279,7 +282,6 @@ def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
 
 
 def gerar_planilha_modelo() -> bytes:
-    """Gera um .xlsx em branco com as colunas corretas."""
     modelo = pd.DataFrame(columns=[
         "Matrícula", "Nome do Aluno", "Turma", "Etapa",
         "1ª Disciplina", "2ª Disciplina", "3ª Disciplina", "4ª Disciplina",
@@ -608,7 +610,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
     # ------------------------------------------------------------------
-    # FORMATO LONGO — uma linha por solicitação
+    # FORMATO LONGO
     # ------------------------------------------------------------------
     linhas_long = []
     for sol in solicitacoes_sel:
@@ -627,7 +629,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
     )
 
     # ------------------------------------------------------------------
-    # FORMATO LARGO — uma linha por aluno (por turma)
+    # FORMATO LARGO
     # ------------------------------------------------------------------
     alunos = {}
     for sol in solicitacoes_sel:
@@ -706,16 +708,25 @@ if st.button("▶️ Rodar verificação", type="primary"):
             st.dataframe(grupo, use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
-    # 🔎 Depuração da leitura dos PDFs
+    # 🔎 Depuração
     # ------------------------------------------------------------------
     with st.expander("🔎 Depuração da leitura dos PDFs (clique para abrir)"):
         st.caption(
             "Mostra o que o Camelot extraiu de cada diário e onde ele achou "
-            "cada coluna de nota. Use isso para conferir se o cabeçalho 'AE' "
-            "foi reconhecido."
+            "cada coluna de nota. Se um aluno estiver como 'não encontrado', "
+            "abra este painel e veja se a matrícula dele aparece na lista."
         )
         for (turma, code), info in diarios_carregados.items():
             st.markdown(f"### Turma {turma} — {info['nome']} (código {code})")
+
+            # 1) Alunos que o app encontrou
+            notas_diario = diarios_notas.get((turma, code), {})
+            st.write(f"**Alunos encontrados:** {len(notas_diario)}")
+            if notas_diario:
+                amostra = list(notas_diario.keys())[:10]
+                st.write(f"Matrículas (10 primeiras): {amostra}")
+
+            # 2) Debug do camelot
             try:
                 dbg = depurar_pdf(info["arquivo"].getvalue())
             except Exception as e:
