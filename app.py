@@ -116,13 +116,11 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
 
 def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
     """Aplica cores condicionais Sim/Não/Diário não enviado na coluna indicada."""
-    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.styles import PatternFill, Font
 
     ws = writer.sheets[sheet_name]
-    if coluna_status not in list(pd.read_excel(BytesIO(), nrows=0)):  # placeholder
-        pass
 
-    # Descobre o índice da coluna (1-based)
+    # Descobre o índice da coluna (1-based) pelo cabeçalho
     header = [c.value for c in ws[1]]
     if coluna_status not in header:
         return
@@ -315,8 +313,10 @@ c2.metric("Diários esperados", total_necessarios_sel)
 c3.metric("Diários carregados", len(diarios_carregados))
 
 if faltando > 0:
-    st.warning(f"⚠️ Faltam **{faltando}** diário(s). Pode rodar mesmo assim — "
-               "eles aparecerão como *Diário não enviado*.")
+    st.warning(
+        f"⚠️ Faltam **{faltando}** diário(s). Pode rodar mesmo assim — "
+        "eles aparecerão como *Diário não enviado*."
+    )
 else:
     st.success("✅ Todos os diários das turmas marcadas foram enviados!")
 
@@ -357,7 +357,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
     # ------------------------------------------------------------------
-    # FORMATO LONGO — uma linha por solicitação (igual retorno.xlsx)
+    # FORMATO LONGO — uma linha por solicitação
     # ------------------------------------------------------------------
     linhas_long = []
     for sol in solicitacoes_sel:
@@ -468,7 +468,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
             grupo = df_wide[df_wide["Turma"] == turma].copy()
             sheet_name = f"Turma {turma}"[:31]
             grupo.to_excel(writer, sheet_name=sheet_name, index=False)
-            # Aplica cor em cada coluna "Lançou a Nota da Xª ..."
             for i in range(1, 5):
                 col_status = f"Lançou a Nota da {i}ª Disciplina? (Sim / Não)"
                 aplicar_formatacao_excel(writer, sheet_name, col_status)
