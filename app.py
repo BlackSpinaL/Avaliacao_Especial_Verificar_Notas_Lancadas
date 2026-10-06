@@ -114,6 +114,47 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
             pass
 
 
+def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
+    """Aplica cores condicionais Sim/Não/Diário não enviado na coluna indicada."""
+    from openpyxl.styles import PatternFill, Font, Alignment
+
+    ws = writer.sheets[sheet_name]
+    if coluna_status not in list(pd.read_excel(BytesIO(), nrows=0)):  # placeholder
+        pass
+
+    # Descobre o índice da coluna (1-based)
+    header = [c.value for c in ws[1]]
+    if coluna_status not in header:
+        return
+    col_idx = header.index(coluna_status) + 1
+
+    verde = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    vermelho = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    laranja = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    cinza = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+
+    verde_f = Font(color="006100")
+    vermelho_f = Font(color="9C0006")
+    laranja_f = Font(color="9C6500")
+
+    for row_idx in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row_idx, column=col_idx)
+        v = str(cell.value).strip() if cell.value is not None else ""
+        if v == "Sim":
+            cell.fill, cell.font = verde, verde_f
+        elif v == "Não":
+            cell.fill, cell.font = vermelho, vermelho_f
+        elif v in ("Diário não enviado", "Aluno não encontrado"):
+            cell.fill, cell.font = laranja, laranja_f
+        elif v == "":
+            cell.fill = cinza
+
+    # Auto-ajuste da largura
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 60)
+
+
 # ---------------------------------------------------------------------------
 # ETAPA 1 — Upload da planilha
 # ---------------------------------------------------------------------------
@@ -166,7 +207,7 @@ if not solicitacoes:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# ETAPA 2 — Diários necessários (visão geral)
+# ETAPA 2 — Diários necessários
 # ---------------------------------------------------------------------------
 st.header("2️⃣ Diários que devem ser enviados")
 
@@ -187,7 +228,6 @@ for (turma, code), info in sorted(necessarios.items()):
     })
 df_resumo = pd.DataFrame(linhas_resumo)
 st.dataframe(df_resumo, use_container_width=True, hide_index=True)
-
 st.caption(
     f"📊 {len(solicitacoes)} solicitação(ões) em "
     f"{len(necessarios)} diário(s) de {df_resumo['Turma'].nunique()} turma(s)."
@@ -202,17 +242,12 @@ st.markdown(
     "diários necessários para cada uma."
 )
 
-# Ajuda visual: quantas turmas existem no total
 turmas = sorted(set(s["turma"] for s in solicitacoes))
 
-# Estado para guardar turmas marcadas
 if f"turmas_sel_{excel_hash}" not in st.session_state:
     st.session_state[f"turmas_sel_{excel_hash}"] = []
 
-turmas_sel = st.session_state[f"turmas_sel_{excel_hash}"]
-
-# Barra de atalhos
-c1, c2, c3 = st.columns([1, 1, 4])
+c1, c2, _ = st.columns([1, 1, 4])
 with c1:
     if st.button("✅ Marcar todas", use_container_width=True):
         for t in turmas:
@@ -244,7 +279,6 @@ for turma in turmas:
         )
         if marcar:
             turmas_marcadas.append(turma)
-
             cols = st.columns(min(len(discs_turma), 3)) if len(discs_turma) > 1 else [st]
             for idx, (code, info) in enumerate(discs_turma):
                 container = cols[idx % len(cols)]
@@ -268,27 +302,21 @@ for turma in turmas:
 
 st.session_state[f"turmas_sel_{excel_hash}"] = turmas_marcadas
 
-# Status
 if not turmas_marcadas:
     st.info("☝️ Marque ao menos uma turma acima para liberar os uploads.")
     st.stop()
 
-total_necessarios_sel = sum(
-    1 for (t, c) in necessarios.keys() if t in turmas_marcadas
-)
+total_necessarios_sel = sum(1 for (t, c) in necessarios.keys() if t in turmas_marcadas)
 faltando = total_necessarios_sel - len(diarios_carregados)
 
-col_a, col_b, col_c = st.columns(3)
-col_a.metric("Turmas marcadas", len(turmas_marcadas))
-col_b.metric("Diários esperados", total_necessarios_sel)
-col_c.metric("Diários carregados", len(diarios_carregados))
+c1, c2, c3 = st.columns(3)
+c1.metric("Turmas marcadas", len(turmas_marcadas))
+c2.metric("Diários esperados", total_necessarios_sel)
+c3.metric("Diários carregados", len(diarios_carregados))
 
 if faltando > 0:
-    st.warning(
-        f"⚠️ Faltam **{faltando}** diário(s) nas turmas marcadas. "
-        "Você pode rodar a verificação mesmo assim — eles aparecerão como "
-        "*Diário não enviado*."
-    )
+    st.warning(f"⚠️ Faltam **{faltando}** diário(s). Pode rodar mesmo assim — "
+               "eles aparecerão como *Diário não enviado*.")
 else:
     st.success("✅ Todos os diários das turmas marcadas foram enviados!")
 
@@ -296,16 +324,11 @@ else:
 # ETAPA 4 — Verificação
 # ---------------------------------------------------------------------------
 st.header("4️⃣ Rodar verificação")
-st.caption(
-    "A verificação será feita **apenas** para as turmas marcadas acima."
-)
 
 if st.button("▶️ Rodar verificação", type="primary"):
 
-    # Filtra solicitações somente das turmas marcadas
     solicitacoes_sel = [s for s in solicitacoes if s["turma"] in turmas_marcadas]
 
-    # Processa PDFs
     diarios_notas = {}
     with st.spinner("Lendo diários..."):
         for (turma, code), info in diarios_carregados.items():
@@ -315,7 +338,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
             except Exception as e:
                 st.warning(f"⚠️ Erro em {turma}/{info['nome']}: {e}")
 
-    # Verifica cada solicitação
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["disciplina_code"])
         if key not in diarios_notas:
@@ -334,7 +356,28 @@ if st.button("▶️ Rodar verificação", type="primary"):
             ae = n_aluno.get("AE", "")
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
-    # Consolida por aluno
+    # ------------------------------------------------------------------
+    # FORMATO LONGO — uma linha por solicitação (igual retorno.xlsx)
+    # ------------------------------------------------------------------
+    linhas_long = []
+    for sol in solicitacoes_sel:
+        linhas_long.append({
+            "Matrícula": sol["matricula"],
+            "Nome do Aluno": sol["nome"],
+            "Turma": sol["turma"],
+            "Etapa": sol["etapa"],
+            "Disciplina": sol["disciplina_raw"],
+            "Lançou a Nota?": sol["status"],
+        })
+    df_long = (
+        pd.DataFrame(linhas_long)
+        .sort_values(by=["Turma", "Nome do Aluno", "Disciplina"])
+        .reset_index(drop=True)
+    )
+
+    # ------------------------------------------------------------------
+    # FORMATO LARGO — uma linha por aluno (por turma)
+    # ------------------------------------------------------------------
     alunos = {}
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["matricula"])
@@ -348,7 +391,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
             }
         alunos[key]["disciplinas"][sol["posicao"]] = sol
 
-    linhas = []
+    linhas_wide = []
     for _, alu in alunos.items():
         linha = {
             "Matrícula": alu["Matrícula"],
@@ -364,15 +407,17 @@ if st.button("▶️ Rodar verificação", type="primary"):
             else:
                 linha[f"{i}ª Disciplina"] = ""
                 linha[f"Lançou a Nota da {i}ª Disciplina? (Sim / Não)"] = ""
-        linhas.append(linha)
+        linhas_wide.append(linha)
 
-    df_result = (
-        pd.DataFrame(linhas)
+    df_wide = (
+        pd.DataFrame(linhas_wide)
         .sort_values(by=["Turma", "Nome do Aluno"])
         .reset_index(drop=True)
     )
 
+    # ------------------------------------------------------------------
     # Resumo
+    # ------------------------------------------------------------------
     st.markdown("---")
     st.subheader("📈 Resumo")
 
@@ -389,22 +434,44 @@ if st.button("▶️ Rodar verificação", type="primary"):
     c4.metric("📄 Diário não enviado", total_sem_diario)
     c5.metric("👤 Aluno não encontrado", total_sem_aluno)
 
-    # Resultado por turma
+    # ------------------------------------------------------------------
+    # Visualização em duas abas
+    # ------------------------------------------------------------------
     st.markdown("---")
-    st.subheader("📋 Resultado por turma (ordem alfabética)")
-    for turma in sorted(df_result["Turma"].unique()):
-        grupo = df_result[df_result["Turma"] == turma].reset_index(drop=True)
-        st.markdown(f"### Turma {turma}")
-        st.dataframe(grupo, use_container_width=True, hide_index=True)
+    tab1, tab2 = st.tabs([
+        "📊 Visão geral por solicitação",
+        "📋 Por turma (por aluno)",
+    ])
 
+    with tab1:
+        st.caption("Uma linha por solicitação — ideal para filtrar por disciplina ou status.")
+        st.dataframe(df_long, use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.caption("Uma linha por aluno — leitura rápida por turma.")
+        for turma in sorted(df_wide["Turma"].unique()):
+            grupo = df_wide[df_wide["Turma"] == turma].reset_index(drop=True)
+            st.markdown(f"### Turma {turma}")
+            st.dataframe(grupo, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------------
     # Excel
+    # ------------------------------------------------------------------
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_result.to_excel(writer, sheet_name="Todas as Turmas", index=False)
-        for turma in sorted(df_result["Turma"].unique()):
-            grupo = df_result[df_result["Turma"] == turma].copy()
+        # Aba 1 — todas as turmas (formato longo)
+        df_long.to_excel(writer, sheet_name="Todas as Turmas", index=False)
+        aplicar_formatacao_excel(writer, "Todas as Turmas", "Lançou a Nota?")
+
+        # Aba por turma (formato largo)
+        for turma in sorted(df_wide["Turma"].unique()):
+            grupo = df_wide[df_wide["Turma"] == turma].copy()
             sheet_name = f"Turma {turma}"[:31]
             grupo.to_excel(writer, sheet_name=sheet_name, index=False)
+            # Aplica cor em cada coluna "Lançou a Nota da Xª ..."
+            for i in range(1, 5):
+                col_status = f"Lançou a Nota da {i}ª Disciplina? (Sim / Não)"
+                aplicar_formatacao_excel(writer, sheet_name, col_status)
 
     st.download_button(
         label="📥 Baixar resultado da varredura (Excel)",
