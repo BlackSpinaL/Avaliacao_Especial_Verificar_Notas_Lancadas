@@ -12,8 +12,8 @@ st.set_page_config(page_title="Verificador AE x Diários", layout="wide")
 st.title("🔍 Verificador de Lançamento de Notas — Avaliação Especial")
 
 st.markdown("""
-**Fluxo:** 1️⃣ envie a planilha de solicitações → 2️⃣ o sistema mostra quais diários
-precisam ser enviados → 3️⃣ faça upload dos diários → 4️⃣ rode a verificação.
+**Fluxo:** 1️⃣ envie a planilha → 2️⃣ veja quais diários são necessários →
+3️⃣ **marque as turmas que você vai analisar** → 4️⃣ faça upload → 5️⃣ rode a verificação.
 """)
 
 COLUNAS_NOTAS = ["AP1/AV1", "AP2/AV2", "TE", "AE", "ND", "TOTAL PARCIAL", "FINAL"]
@@ -90,7 +90,6 @@ def eh_tabela_de_notas(df_bruto):
 
 @st.cache_data(show_spinner=False)
 def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
-    """Retorna {matricula: {coluna: valor}} extraído do PDF."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -127,9 +126,7 @@ if not uploaded_excel:
     st.info("⬆️ Envie a planilha para começar.")
     st.stop()
 
-# Hash para invalidar uploads se a planilha mudar
 excel_hash = hashlib.md5(uploaded_excel.getvalue()).hexdigest()[:8]
-
 df_excel = pd.read_excel(uploaded_excel)
 disc_cols = [c for c in df_excel.columns if "Disciplina" in str(c)]
 
@@ -169,11 +166,10 @@ if not solicitacoes:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# ETAPA 2 — Diários necessários
+# ETAPA 2 — Diários necessários (visão geral)
 # ---------------------------------------------------------------------------
 st.header("2️⃣ Diários que devem ser enviados")
 
-# Agrupa (turma, codigo) -> {nome, quantidade}
 necessarios = {}
 for sol in solicitacoes:
     key = (sol["turma"], sol["disciplina_code"])
@@ -181,7 +177,6 @@ for sol in solicitacoes:
         necessarios[key] = {"nome": sol["disciplina_name"], "qtd": 0}
     necessarios[key]["qtd"] += 1
 
-# Tabela resumo geral
 linhas_resumo = []
 for (turma, code), info in sorted(necessarios.items()):
     linhas_resumo.append({
@@ -199,52 +194,118 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
-# ETAPA 3 — Upload por turma/disciplina
+# ETAPA 3 — Seleção de turmas + uploads
 # ---------------------------------------------------------------------------
-st.header("3️⃣ Faça upload dos diários")
+st.header("3️⃣ Selecione as turmas que você vai verificar")
 st.markdown(
-    "Os campos estão agrupados por **turma**. Envie o PDF correspondente a cada disciplina."
+    "Marque apenas as turmas da sua supervisão. Depois faça o upload dos "
+    "diários necessários para cada uma."
 )
 
-diarios_carregados = {}
+# Ajuda visual: quantas turmas existem no total
 turmas = sorted(set(s["turma"] for s in solicitacoes))
+
+# Estado para guardar turmas marcadas
+if f"turmas_sel_{excel_hash}" not in st.session_state:
+    st.session_state[f"turmas_sel_{excel_hash}"] = []
+
+turmas_sel = st.session_state[f"turmas_sel_{excel_hash}"]
+
+# Barra de atalhos
+c1, c2, c3 = st.columns([1, 1, 4])
+with c1:
+    if st.button("✅ Marcar todas", use_container_width=True):
+        for t in turmas:
+            st.session_state[f"chk_{excel_hash}_{t}"] = True
+        st.rerun()
+with c2:
+    if st.button("🧹 Limpar", use_container_width=True):
+        for t in turmas:
+            st.session_state[f"chk_{excel_hash}_{t}"] = False
+        st.rerun()
+
+diarios_carregados = {}
+turmas_marcadas = []
 
 for turma in turmas:
     discs_turma = sorted(
         [(c, d) for (t, c), d in necessarios.items() if t == turma],
         key=lambda x: x[1]["nome"],
     )
-    with st.expander(f"📘 Turma {turma} — {len(discs_turma)} diário(s)", expanded=True):
-        for code, info in discs_turma:
-            up = st.file_uploader(
-                f"**{info['nome']}** ({info['qtd']} solicitações) — código {code or '—'}",
-                type=["pdf"],
-                key=f"pdf_{excel_hash}_{turma}_{code}",
-            )
-            if up is not None:
-                diarios_carregados[(turma, code)] = {
-                    "arquivo": up,
-                    "nome": info["nome"],
-                }
+    qtd_sol = sum(d["qtd"] for _, d in discs_turma)
 
-faltando = len(necessarios) - len(diarios_carregados)
+    with st.expander(
+        f"📘 Turma {turma} — {len(discs_turma)} diário(s) • {qtd_sol} solicitação(ões)",
+        expanded=False,
+    ):
+        marcar = st.checkbox(
+            "Caso deseje verificar os diários dessa turma, marque aqui",
+            key=f"chk_{excel_hash}_{turma}",
+        )
+        if marcar:
+            turmas_marcadas.append(turma)
+
+            cols = st.columns(min(len(discs_turma), 3)) if len(discs_turma) > 1 else [st]
+            for idx, (code, info) in enumerate(discs_turma):
+                container = cols[idx % len(cols)]
+                with container:
+                    st.markdown(
+                        f"**{info['nome']}**  \n"
+                        f"<small>{info['qtd']} solicitação(ões) — código {code or '—'}</small>",
+                        unsafe_allow_html=True,
+                    )
+                    up = st.file_uploader(
+                        f"Upload {info['nome']} (turma {turma})",
+                        type=["pdf"],
+                        key=f"pdf_{excel_hash}_{turma}_{code}",
+                        label_visibility="collapsed",
+                    )
+                    if up is not None:
+                        diarios_carregados[(turma, code)] = {
+                            "arquivo": up,
+                            "nome": info["nome"],
+                        }
+
+st.session_state[f"turmas_sel_{excel_hash}"] = turmas_marcadas
+
+# Status
+if not turmas_marcadas:
+    st.info("☝️ Marque ao menos uma turma acima para liberar os uploads.")
+    st.stop()
+
+total_necessarios_sel = sum(
+    1 for (t, c) in necessarios.keys() if t in turmas_marcadas
+)
+faltando = total_necessarios_sel - len(diarios_carregados)
+
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("Turmas marcadas", len(turmas_marcadas))
+col_b.metric("Diários esperados", total_necessarios_sel)
+col_c.metric("Diários carregados", len(diarios_carregados))
+
 if faltando > 0:
     st.warning(
-        f"⚠️ Faltam **{faltando}** diário(s). "
+        f"⚠️ Faltam **{faltando}** diário(s) nas turmas marcadas. "
         "Você pode rodar a verificação mesmo assim — eles aparecerão como "
         "*Diário não enviado*."
     )
 else:
-    st.success("✅ Todos os diários necessários foram enviados!")
+    st.success("✅ Todos os diários das turmas marcadas foram enviados!")
 
 # ---------------------------------------------------------------------------
 # ETAPA 4 — Verificação
 # ---------------------------------------------------------------------------
 st.header("4️⃣ Rodar verificação")
+st.caption(
+    "A verificação será feita **apenas** para as turmas marcadas acima."
+)
 
 if st.button("▶️ Rodar verificação", type="primary"):
 
-    # -------- Processa PDFs --------
+    # Filtra solicitações somente das turmas marcadas
+    solicitacoes_sel = [s for s in solicitacoes if s["turma"] in turmas_marcadas]
+
+    # Processa PDFs
     diarios_notas = {}
     with st.spinner("Lendo diários..."):
         for (turma, code), info in diarios_carregados.items():
@@ -254,8 +315,8 @@ if st.button("▶️ Rodar verificação", type="primary"):
             except Exception as e:
                 st.warning(f"⚠️ Erro em {turma}/{info['nome']}: {e}")
 
-    # -------- Verifica cada solicitação --------
-    for sol in solicitacoes:
+    # Verifica cada solicitação
+    for sol in solicitacoes_sel:
         key = (sol["turma"], sol["disciplina_code"])
         if key not in diarios_notas:
             sol["status"] = "Diário não enviado"
@@ -273,9 +334,9 @@ if st.button("▶️ Rodar verificação", type="primary"):
             ae = n_aluno.get("AE", "")
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
-    # -------- Consolida por aluno --------
+    # Consolida por aluno
     alunos = {}
-    for sol in solicitacoes:
+    for sol in solicitacoes_sel:
         key = (sol["turma"], sol["matricula"])
         if key not in alunos:
             alunos[key] = {
@@ -311,15 +372,15 @@ if st.button("▶️ Rodar verificação", type="primary"):
         .reset_index(drop=True)
     )
 
-    # -------- Resumo --------
+    # Resumo
     st.markdown("---")
     st.subheader("📈 Resumo")
 
-    total_sol = len(solicitacoes)
-    total_sim = sum(1 for s in solicitacoes if s["status"] == "Sim")
-    total_nao = sum(1 for s in solicitacoes if s["status"] == "Não")
-    total_sem_diario = sum(1 for s in solicitacoes if s["status"] == "Diário não enviado")
-    total_sem_aluno = sum(1 for s in solicitacoes if s["status"] == "Aluno não encontrado")
+    total_sol = len(solicitacoes_sel)
+    total_sim = sum(1 for s in solicitacoes_sel if s["status"] == "Sim")
+    total_nao = sum(1 for s in solicitacoes_sel if s["status"] == "Não")
+    total_sem_diario = sum(1 for s in solicitacoes_sel if s["status"] == "Diário não enviado")
+    total_sem_aluno = sum(1 for s in solicitacoes_sel if s["status"] == "Aluno não encontrado")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total de solicitações", total_sol)
@@ -328,7 +389,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
     c4.metric("📄 Diário não enviado", total_sem_diario)
     c5.metric("👤 Aluno não encontrado", total_sem_aluno)
 
-    # -------- Resultado por turma --------
+    # Resultado por turma
     st.markdown("---")
     st.subheader("📋 Resultado por turma (ordem alfabética)")
     for turma in sorted(df_result["Turma"].unique()):
@@ -336,7 +397,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
         st.markdown(f"### Turma {turma}")
         st.dataframe(grupo, use_container_width=True, hide_index=True)
 
-    # -------- Excel --------
+    # Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_result.to_excel(writer, sheet_name="Todas as Turmas", index=False)
