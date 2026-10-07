@@ -18,13 +18,14 @@ st.markdown("""
 
 COLUNAS_NOTAS = ["AP1/AV1", "AP2/AV2", "TE", "AE", "ND", "TOTAL PARCIAL", "FINAL"]
 
+# Variantes normalizadas (sem / e sem espaço) de cada coluna
 ALIASES_NOTAS = {
     "AP1/AV1":       ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1"],
     "AP2/AV2":       ["AP2/AV2", "AV2/AP2", "AP2AV2", "AV2AP2",
                       "AP2/AS", "AP2AS", "AS/AP2"],
     "TE":            ["TE"],
-    "AE":            ["AE", "A E"],
-    "ND":            ["ND", "N D"],
+    "AE":            ["AE"],
+    "ND":            ["ND"],
     "TOTAL PARCIAL": ["TOTALPARCIAL"],
     "FINAL":         ["FINAL"],
 }
@@ -43,14 +44,13 @@ def normalizar(s):
     return s
 
 
-def normalizar_header(s):
-    """Normaliza cabeçalhos de PDF: remove acentos, hífens, quebras de linha."""
-    if s is None:
+def normalizar_celula(celula):
+    """Normaliza célula de cabeçalho: uppercase, sem acento, só A-Z0-9."""
+    if celula is None:
         return ""
-    s = str(s).upper()
+    s = str(celula).upper()
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
-    s = re.sub(r"[^A-Z0-9/ ]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^A-Z0-9]", "", s)
     return s
 
 
@@ -76,48 +76,80 @@ def valor_em_branco(valor):
         return False
 
 
-def _indice_coluna_por_alias(header_cells, variantes_norm):
-    for i, h in enumerate(header_cells):
-        h_norm = normalizar_header(h).replace(" ", "")
-        if h_norm in variantes_norm:
-            return i
-    return None
+def match_alias(celula_norm, nome_logico):
+    """Verifica se a célula normalizada bate com algum alias do nome lógico."""
+    if not celula_norm:
+        return False
+    variantes = ALIASES_NOTAS.get(nome_logico, [])
+    variantes_norm = [normalizar_celula(v) for v in variantes]
+    for v in variantes_norm:
+        if celula_norm == v:
+            return True
+        # Aceita sufixo quando o alias é composto (>= 4 chars)
+        # cobre casos como "AVALIACOESREFERENTESAAP1AV1"
+        if len(v) >= 4 and celula_norm.endswith(v):
+            return True
+    return False
 
 
-def localizar_colunas_notas(df_bruto):
+def encontrar_header_e_indices(df_bruto):
     """
-    Procura as colunas de notas varrendo até as 5 primeiras linhas do
-    DataFrame extraído. Retorna dict {nome_logico: indice}.
+    Varre as primeiras linhas do DataFrame e devolve:
+      (header_row_idx, ap1_idx, ae_idx)
+    onde header_row_idx é a linha que mais se parece com o cabeçalho de notas.
     """
-    melhor = {}
-    for r in range(min(5, len(df_bruto))):
-        linha = list(df_bruto.iloc[r])
-        achados = {}
-        for nome_logico, variantes in ALIASES_NOTAS.items():
-            variantes_norm = [v.replace(" ", "") for v in variantes]
-            idx = _indice_coluna_por_alias(linha, variantes_norm)
-            if idx is not None:
-                achados[nome_logico] = idx
-        if "AE" in achados and len(achados) >= 2:
-            return achados
-        if len(achados) > len(melhor):
-            melhor = achados
+    n_rows = min(15, len(df_bruto))
+    melhor = (None, None, None, 0)
+    for r in range(n_rows):
+        linha = [normalizar_celula(c) for c in df_bruto.iloc[r]]
+        ap1_idx = None
+        ae_idx = None
+        count = 0
+        for i, h in enumerate(linha):
+            if ap1_idx is None and match_alias(h, "AP1/AV1"):
+                ap1_idx = i
+            if ae_idx is None and match_alias(h, "AE"):
+                ae_idx = i
+            if match_alias(h, "TOTAL PARCIAL"):
+                count += 1
+            if match_alias(h, "AP2/AV2"):
+                count += 1
+            if match_alias(h, "TE"):
+                count += 1
+            if match_alias(h, "FINAL"):
+                count += 1
+        # Prioriza linha que tem AE + AP1
+        if ae_idx is not None and ap1_idx is not None:
+            return (r, ap1_idx, ae_idx)
+        # Registra a melhor linha parcial
+        if (ae_idx is not None) and count > melhor[3]:
+            melhor = (r, ap1_idx, ae_idx, count)
+    if melhor[2] is not None:
+        return (melhor[0], melhor[1], melhor[2])
+    return (None, None, None)
 
-    # tenta também nos nomes das colunas do DataFrame
-    achados = {}
-    for nome_logico, variantes in ALIASES_NOTAS.items():
-        variantes_norm = [v.replace(" ", "") for v in variantes]
-        idx = _indice_coluna_por_alias(list(df_bruto.columns), variantes_norm)
-        if idx is not None:
-            achados[nome_logico] = idx
-    if "AE" in achados and len(achados) >= 2:
-        return achados
 
-    return melhor
+def descobrir_indice_inicio_notas(df_bruto, n_cols):
+    """
+    Descobre o índice da primeira coluna de notas (AP1/AV1).
+    Estratégia:
+      1) Encontrar 'AP1/AV1' no cabeçalho
+      2) Encontrar 'AE' no cabeçalho e subtrair 3
+      3) Fallback: assumir 7 colunas no final
+    """
+    _, ap1_idx, ae_idx = encontrar_header_e_indices(df_bruto)
+
+    if ap1_idx is not None:
+        return ap1_idx
+    if ae_idx is not None and ae_idx >= 3:
+        return ae_idx - 3
+    # Fallback: último recurso
+    return max(0, n_cols - 7)
 
 
 def extrair_tabela_notas(df_bruto):
-    """Extrai as notas dos alunos do DataFrame já lido do PDF."""
+    """Extrai notas dos alunos do DataFrame já lido do PDF."""
+    # Linhas de alunos: primeira célula é número de chamada (1 a 3 dígitos)
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
         primeira = str(row.iloc[0]).strip()
@@ -131,8 +163,13 @@ def extrair_tabela_notas(df_bruto):
     if n_cols < 4:
         return None
 
-    indices = localizar_colunas_notas(df_bruto)
-    usar_header = ("AE" in indices)
+    # Índice da primeira coluna de notas
+    first_note_idx = descobrir_indice_inicio_notas(df_bruto, n_cols)
+
+    def safe_get(row, idx):
+        if idx is None or idx < 0 or idx >= n_cols:
+            return ""
+        return row.iloc[idx]
 
     registros = []
     for row in linhas_alunos:
@@ -143,15 +180,21 @@ def extrair_tabela_notas(df_bruto):
 
         reg = {"MATRICULA": matricula, "NOME": nome}
 
-        if usar_header:
-            for nome_logico in COLUNAS_NOTAS:
-                idx = indices.get(nome_logico)
-                reg[nome_logico] = row.iloc[idx] if idx is not None else ""
-        else:
-            # fallback: assume as últimas 7 colunas como notas
-            notas = row.iloc[n_cols - 7:n_cols].tolist()
-            for nome_col, val in zip(COLUNAS_NOTAS, notas):
-                reg[nome_col] = val
+        # Mapeamento posicional a partir de first_note_idx:
+        #   +0 = AP1/AV1
+        #   +1 = AP2/AV2
+        #   +2 = TE
+        #   +3 = AE          <-- sempre
+        #   +4 = ND          (pode não existir)
+        #   n_cols - 2 = TOTAL PARCIAL
+        #   n_cols - 1 = FINAL
+        reg["AP1/AV1"]       = safe_get(row, first_note_idx)
+        reg["AP2/AV2"]       = safe_get(row, first_note_idx + 1)
+        reg["TE"]            = safe_get(row, first_note_idx + 2)
+        reg["AE"]            = safe_get(row, first_note_idx + 3)
+        reg["ND"]            = safe_get(row, first_note_idx + 4)
+        reg["TOTAL PARCIAL"] = safe_get(row, n_cols - 2)
+        reg["FINAL"]         = safe_get(row, n_cols - 1)
 
         registros.append(reg)
 
@@ -228,13 +271,18 @@ def depurar_pdf(pdf_bytes: bytes):
             info_tabs = []
             for i, t in enumerate(tabs):
                 df = t.df
-                indices = localizar_colunas_notas(df)
+                header_idx, ap1_idx, ae_idx = encontrar_header_e_indices(df)
+                first_note_idx = descobrir_indice_inicio_notas(df, df.shape[1])
                 info_tabs.append({
                     "indice": i,
                     "shape": df.shape,
-                    "header_linha0": list(df.iloc[0]) if len(df) > 0 else [],
-                    "header_linha1": list(df.iloc[1]) if len(df) > 1 else [],
-                    "colunas_encontradas": indices,
+                    "header_row_idx": header_idx,
+                    "ap1_idx": ap1_idx,
+                    "ae_idx": ae_idx,
+                    "first_note_idx": first_note_idx,
+                    "header_linha_detectada": (
+                        list(df.iloc[header_idx]) if header_idx is not None else []
+                    ),
                     "eh_tabela_notas": eh_tabela_de_notas(df),
                 })
             resultado[flavor] = {"erro": None, "tabelas": info_tabs}
@@ -713,20 +761,17 @@ if st.button("▶️ Rodar verificação", type="primary"):
     with st.expander("🔎 Depuração da leitura dos PDFs (clique para abrir)"):
         st.caption(
             "Mostra o que o Camelot extraiu de cada diário e onde ele achou "
-            "cada coluna de nota. Se um aluno estiver como 'não encontrado', "
-            "abra este painel e veja se a matrícula dele aparece na lista."
+            "cada coluna de nota."
         )
         for (turma, code), info in diarios_carregados.items():
             st.markdown(f"### Turma {turma} — {info['nome']} (código {code})")
 
-            # 1) Alunos que o app encontrou
             notas_diario = diarios_notas.get((turma, code), {})
             st.write(f"**Alunos encontrados:** {len(notas_diario)}")
             if notas_diario:
                 amostra = list(notas_diario.keys())[:10]
                 st.write(f"Matrículas (10 primeiras): {amostra}")
 
-            # 2) Debug do camelot
             try:
                 dbg = depurar_pdf(info["arquivo"].getvalue())
             except Exception as e:
@@ -742,9 +787,11 @@ if st.button("▶️ Rodar verificação", type="primary"):
                         f"- Tabela #{t['indice']} — shape={t['shape']} — "
                         f"é tabela de notas? **{t['eh_tabela_notas']}**"
                     )
-                    st.write("  - cabeçalho linha 0:", t["header_linha0"][:15], "...")
-                    st.write("  - cabeçalho linha 1:", t["header_linha1"][:15], "...")
-                    st.write("  - colunas encontradas:", t["colunas_encontradas"])
+                    st.write(f"  - header_row_idx: {t['header_row_idx']}")
+                    st.write(f"  - AP1/AV1 idx: {t['ap1_idx']}  |  AE idx: {t['ae_idx']}")
+                    st.write(f"  - first_note_idx usado: {t['first_note_idx']}")
+                    st.write("  - linha de cabeçalho detectada:",
+                             t["header_linha_detectada"][:15], "...")
 
     # ------------------------------------------------------------------
     # Excel
