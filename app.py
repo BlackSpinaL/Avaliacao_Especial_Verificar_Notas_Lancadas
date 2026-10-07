@@ -44,7 +44,6 @@ def normalizar(s):
 
 
 def normalizar_celula(celula):
-    """Normaliza célula: uppercase, sem acento, só A-Z0-9."""
     if celula is None:
         return ""
     s = str(celula).upper()
@@ -89,12 +88,7 @@ def match_alias(celula_norm, nome_logico):
 
 
 def contar_colunas_notas(df_bruto):
-    """
-    Detecta quantas colunas de notas o diário possui (7, 8 ou 9).
-      - 7 colunas: AP1, AP2, TE, AE, ND, TOTAL, FINAL
-      - 8 colunas: AP1, AP2, TE, AE, ND, RECUPERAÇÃO, TOTAL, FINAL
-      - 9 colunas: AP1, AP2, TE, AE, ND, RECUPERAÇÃO, LABORATÓRIO, TOTAL, FINAL
-    """
+    """Detecta quantas colunas de notas o diário possui (7, 8 ou 9)."""
     texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
     texto_norm = unicodedata.normalize("NFKD", texto).encode("ASCII", "ignore").decode("ASCII")
     texto_norm = re.sub(r"[^A-Z]", "", texto_norm)
@@ -110,10 +104,7 @@ def contar_colunas_notas(df_bruto):
 
 
 def extrair_tabela_notas(df_bruto):
-    """
-    As colunas de notas estão sempre no fim. Detectamos quantas são (7, 8 ou 9)
-    e lemos por posição relativa ao fim.
-    """
+    """Extrai notas dos alunos — leitura por posição relativa ao fim."""
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
         primeira = str(row.iloc[0]).strip()
@@ -128,7 +119,6 @@ def extrair_tabela_notas(df_bruto):
         return None
 
     n_notas = contar_colunas_notas(df_bruto)
-
     if n_notas > n_cols - 2:
         n_notas = 7
 
@@ -168,14 +158,37 @@ def eh_tabela_de_notas(df_bruto):
     return sum(1 for m in marcadores if m in texto_norm) >= 2
 
 
+def _tentar_flavor(tmp_path: str, **kwargs):
+    """Roda camelot com os parâmetros dados e devolve (notas, n_notas_max)."""
+    try:
+        tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
+    except Exception:
+        return {}, 0
+    notas = {}
+    n_notas_max = 0
+    for t in tabs:
+        if not eh_tabela_de_notas(t.df):
+            continue
+        n_notas = contar_colunas_notas(t.df)
+        df = extrair_tabela_notas(t.df)
+        if df is None:
+            continue
+        for _, row in df.iterrows():
+            notas[row["MATRICULA"]] = row.to_dict()
+        n_notas_max = max(n_notas_max, n_notas)
+    return notas, n_notas_max
+
+
 @st.cache_data(show_spinner=False)
 def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
     """
-    Roda stream E lattice. Devolve o resultado com:
-      1) mais alunos encontrados
-      2) em caso de empate, mais colunas de notas detectadas
-    Isso resolve o caso do CIÊNCIAS, em que o stream mescla colunas
-    (detecta 7 em vez de 9), mas o lattice preserva as 9.
+    Roda 3 configurações do camelot:
+      1) lattice com line_scale=40 (mais sensível a linhas finas)
+      2) lattice padrão
+      3) stream
+    Escolhe:
+      - lattice_40 se ele encontrou >= 20 alunos (resolve CIÊNCIAS)
+      - senão, o que tiver mais alunos (desempate: mais colunas de notas)
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
@@ -183,36 +196,27 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
 
     try:
         tentativas = [
-            ("stream",  {"flavor": "stream",  "strip_text": "\n"}),
-            ("lattice", {"flavor": "lattice"}),
+            ("lattice_40", {"flavor": "lattice", "line_scale": 40}),
+            ("lattice_15", {"flavor": "lattice"}),
+            ("stream",     {"flavor": "stream",  "strip_text": "\n"}),
         ]
-        resultados = []  # lista de (n_alunos, n_notas, notas_dict)
-        for nome_flavor, kwargs in tentativas:
-            try:
-                tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
-            except Exception:
-                continue
-            notas = {}
-            n_notas_max = 0
-            for t in tabs:
-                if not eh_tabela_de_notas(t.df):
-                    continue
-                n_notas = contar_colunas_notas(t.df)
-                df = extrair_tabela_notas(t.df)
-                if df is None:
-                    continue
-                for _, row in df.iterrows():
-                    notas[row["MATRICULA"]] = row.to_dict()
-                n_notas_max = max(n_notas_max, n_notas)
+        resultados = []
+        for label, kwargs in tentativas:
+            notas, n_notas = _tentar_flavor(tmp_path, **kwargs)
             if notas:
-                resultados.append((len(notas), n_notas_max, notas))
+                resultados.append((label, len(notas), n_notas, notas))
 
         if not resultados:
             return {}
 
-        # Ordena por (n_alunos, n_notas) decrescente. O primeiro vence.
-        resultados.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return resultados[0][2]
+        # 1ª preferência: lattice_40 com muitos alunos
+        for label, n_alunos, n_notas, notas in resultados:
+            if label == "lattice_40" and n_alunos >= 20:
+                return notas
+
+        # Fallback: maior número de alunos, desempate por mais colunas de notas
+        resultados.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        return resultados[0][3]
     finally:
         try:
             os.unlink(tmp_path)
@@ -228,14 +232,16 @@ def depurar_pdf(pdf_bytes: bytes):
 
     try:
         resultado = {}
-        for flavor in ("stream", "lattice"):
-            kwargs = {"flavor": flavor}
-            if flavor == "stream":
-                kwargs["strip_text"] = "\n"
+        tentativas = [
+            ("lattice_40", {"flavor": "lattice", "line_scale": 40}),
+            ("lattice_15", {"flavor": "lattice"}),
+            ("stream",     {"flavor": "stream",  "strip_text": "\n"}),
+        ]
+        for label, kwargs in tentativas:
             try:
                 tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
             except Exception as e:
-                resultado[flavor] = {"erro": str(e), "tabelas": []}
+                resultado[label] = {"erro": str(e), "tabelas": []}
                 continue
 
             info_tabs = []
@@ -252,7 +258,7 @@ def depurar_pdf(pdf_bytes: bytes):
                     "AE_idx_calculado": first_note_idx + 3,
                     "eh_tabela_notas": eh_tabela_de_notas(df),
                 })
-            resultado[flavor] = {"erro": None, "tabelas": info_tabs}
+            resultado[label] = {"erro": None, "tabelas": info_tabs}
         return resultado
     finally:
         try:
@@ -624,9 +630,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
             ae = n_aluno.get("AE", "")
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
-    # ------------------------------------------------------------------
     # FORMATO LONGO
-    # ------------------------------------------------------------------
     linhas_long = []
     for sol in solicitacoes_sel:
         linhas_long.append({
@@ -643,9 +647,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
         .reset_index(drop=True)
     )
 
-    # ------------------------------------------------------------------
     # FORMATO LARGO
-    # ------------------------------------------------------------------
     alunos = {}
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["matricula"])
@@ -683,9 +685,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
         .reset_index(drop=True)
     )
 
-    # ------------------------------------------------------------------
     # Resumo
-    # ------------------------------------------------------------------
     st.markdown("---")
     st.subheader("📈 Resumo")
 
@@ -702,9 +702,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
     c4.metric("📄 Diário não enviado", total_sem_diario)
     c5.metric("👤 Aluno não encontrado", total_sem_aluno)
 
-    # ------------------------------------------------------------------
-    # Visualização em duas abas
-    # ------------------------------------------------------------------
     st.markdown("---")
     tab1, tab2 = st.tabs([
         "📊 Visão geral por solicitação",
@@ -722,19 +719,17 @@ if st.button("▶️ Rodar verificação", type="primary"):
             st.markdown(f"### Turma {turma}")
             st.dataframe(grupo, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------------------------
     # 🔎 Depuração
-    # ------------------------------------------------------------------
     with st.expander("🔎 Depuração da leitura dos PDFs (clique para abrir)"):
         st.caption(
-            "Mostra o que o Camelot extraiu de cada diário, quantas colunas de "
-            "notas foram detectadas e onde o AE foi posicionado."
+            "Mostra o que o Camelot extraiu de cada diário com 3 configurações "
+            "diferentes. Veja qual delas encontrou mais alunos."
         )
         for (turma, code), info in diarios_carregados.items():
             st.markdown(f"### Turma {turma} — {info['nome']} (código {code})")
 
             notas_diario = diarios_notas.get((turma, code), {})
-            st.write(f"**Alunos encontrados:** {len(notas_diario)}")
+            st.write(f"**Alunos encontrados (após escolha):** {len(notas_diario)}")
             if notas_diario:
                 amostra = list(notas_diario.keys())[:10]
                 st.write(f"Matrículas (10 primeiras): {amostra}")
@@ -746,7 +741,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
                 continue
 
             for flavor, res in dbg.items():
-                st.markdown(f"**Flavor `{flavor}`** — {res['erro'] or 'ok'}")
+                st.markdown(f"**Config `{flavor}`** — {res['erro'] or 'ok'}")
                 if res["erro"]:
                     continue
                 for t in res["tabelas"]:
@@ -762,9 +757,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
                         f"| AE_idx calculado: **{t['AE_idx_calculado']}**"
                     )
 
-    # ------------------------------------------------------------------
     # Excel
-    # ------------------------------------------------------------------
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_long.to_excel(writer, sheet_name="Todas as Turmas", index=False)
