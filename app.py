@@ -784,7 +784,3 @@ if st.button("▶️ Rodar verificação", type="primary"):
         file_name="resultado_varredura_avaliacao_especial.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    # salve o app.py novo por cima do antigo
-git add app.py
-git commit -m "Corrige leitura da coluna AE em diários de CIÊNCIAS"
-git push origin main
