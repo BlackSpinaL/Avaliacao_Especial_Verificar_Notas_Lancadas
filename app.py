@@ -91,7 +91,6 @@ def match_alias(celula_norm, nome_logico):
 def contar_colunas_notas(df_bruto):
     """
     Detecta quantas colunas de notas o diário possui (7, 8 ou 9).
-    Layouts observados:
       - 7 colunas: AP1, AP2, TE, AE, ND, TOTAL, FINAL
       - 8 colunas: AP1, AP2, TE, AE, ND, RECUPERAÇÃO, TOTAL, FINAL
       - 9 colunas: AP1, AP2, TE, AE, ND, RECUPERAÇÃO, LABORATÓRIO, TOTAL, FINAL
@@ -112,10 +111,8 @@ def contar_colunas_notas(df_bruto):
 
 def extrair_tabela_notas(df_bruto):
     """
-    Extrai notas dos alunos do DataFrame já lido do PDF.
-
-    Estratégia: as colunas de notas estão SEMPRE no fim da tabela.
-    Detectamos quantas são (7, 8 ou 9) e as lemos por posição relativa ao fim.
+    As colunas de notas estão sempre no fim. Detectamos quantas são (7, 8 ou 9)
+    e lemos por posição relativa ao fim.
     """
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
@@ -132,11 +129,10 @@ def extrair_tabela_notas(df_bruto):
 
     n_notas = contar_colunas_notas(df_bruto)
 
-    # Sanidade: se n_notas > n_cols, cai no fallback
     if n_notas > n_cols - 2:
         n_notas = 7
 
-    first_note_idx = n_cols - n_notas  # índice da coluna AP1/AV1
+    first_note_idx = n_cols - n_notas
 
     def safe_get(row, idx):
         if idx is None or idx < 0 or idx >= n_cols:
@@ -151,7 +147,6 @@ def extrair_tabela_notas(df_bruto):
             continue
 
         reg = {"MATRICULA": matricula, "NOME": nome}
-        # Ordem sempre: AP1, AP2, TE, AE, ND, [RECUP], [LAB], TOTAL, FINAL
         reg["AP1/AV1"]       = safe_get(row, first_note_idx + 0)
         reg["AP2/AV2"]       = safe_get(row, first_note_idx + 1)
         reg["TE"]            = safe_get(row, first_note_idx + 2)
@@ -166,7 +161,6 @@ def extrair_tabela_notas(df_bruto):
 
 
 def eh_tabela_de_notas(df_bruto):
-    """Verifica se a tabela parece ser o diário de notas."""
     texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
     texto_norm = re.sub(r"\s+", "", texto)
     marcadores = ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1",
@@ -176,7 +170,13 @@ def eh_tabela_de_notas(df_bruto):
 
 @st.cache_data(show_spinner=False)
 def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
-    """Tenta stream e lattice, e devolve o resultado com mais alunos."""
+    """
+    Roda stream E lattice. Devolve o resultado com:
+      1) mais alunos encontrados
+      2) em caso de empate, mais colunas de notas detectadas
+    Isso resolve o caso do CIÊNCIAS, em que o stream mescla colunas
+    (detecta 7 em vez de 9), mas o lattice preserva as 9.
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -186,26 +186,33 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
             ("stream",  {"flavor": "stream",  "strip_text": "\n"}),
             ("lattice", {"flavor": "lattice"}),
         ]
-        resultados = {}
+        resultados = []  # lista de (n_alunos, n_notas, notas_dict)
         for nome_flavor, kwargs in tentativas:
             try:
                 tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
             except Exception:
                 continue
             notas = {}
+            n_notas_max = 0
             for t in tabs:
                 if not eh_tabela_de_notas(t.df):
                     continue
+                n_notas = contar_colunas_notas(t.df)
                 df = extrair_tabela_notas(t.df)
                 if df is None:
                     continue
                 for _, row in df.iterrows():
                     notas[row["MATRICULA"]] = row.to_dict()
-            resultados[nome_flavor] = notas
+                n_notas_max = max(n_notas_max, n_notas)
+            if notas:
+                resultados.append((len(notas), n_notas_max, notas))
 
         if not resultados:
             return {}
-        return max(resultados.values(), key=len)
+
+        # Ordena por (n_alunos, n_notas) decrescente. O primeiro vence.
+        resultados.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return resultados[0][2]
     finally:
         try:
             os.unlink(tmp_path)
@@ -215,7 +222,6 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
 
 @st.cache_data(show_spinner=False)
 def depurar_pdf(pdf_bytes: bytes):
-    """Devolve informações de debug para inspeção."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
@@ -778,3 +784,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
         file_name="resultado_varredura_avaliacao_especial.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    # salve o app.py novo por cima do antigo
+git add app.py
+git commit -m "Corrige leitura da coluna AE em diários de CIÊNCIAS"
+git push origin main
