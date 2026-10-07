@@ -6,6 +6,7 @@ import os
 import hashlib
 import tempfile
 import unicodedata
+import concurrent.futures
 from io import BytesIO
 
 st.set_page_config(page_title="Verificador AE x Diários", layout="wide")
@@ -13,7 +14,7 @@ st.title("🔍 Verificador de Lançamento de Notas — Avaliação Especial")
 
 st.markdown("""
 **Fluxo:** 1️⃣ envie a planilha → 2️⃣ veja quais diários são necessários →
-3️⃣ **marque as turmas que você vai analisar** → 4️⃣ faça upload → 5️⃣ rode a verificação.
+3️⃣ **escolha uma turma** → 4️⃣ faça upload dos diários dela → 5️⃣ rode a verificação.
 """)
 
 COLUNAS_NOTAS = ["AP1/AV1", "AP2/AV2", "TE", "AE", "ND", "TOTAL PARCIAL", "FINAL"]
@@ -75,23 +76,17 @@ def valor_em_branco(valor):
 
 
 def contar_colunas_notas(df_bruto):
-    """Detecta quantas colunas de notas o diário possui (7, 8 ou 9)."""
     texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
     texto_norm = unicodedata.normalize("NFKD", texto).encode("ASCII", "ignore").decode("ASCII")
     texto_norm = re.sub(r"[^A-Z]", "", texto_norm)
-
-    tem_lab = "LABORATORIO" in texto_norm
-    tem_recup = "RECUPERACAO" in texto_norm or "RECUPERAC" in texto_norm
-
-    if tem_lab:
+    if "LABORATORIO" in texto_norm:
         return 9
-    if tem_recup:
+    if "RECUPERACAO" in texto_norm or "RECUPERAC" in texto_norm:
         return 8
     return 7
 
 
 def contar_valores_nao_zero(df_bruto, linhas_alunos, idx):
-    """Conta quantos alunos têm valor numérico != 0 na coluna idx."""
     n_cols = df_bruto.shape[1]
     if idx is None or idx < 0 or idx >= n_cols:
         return -1
@@ -107,13 +102,6 @@ def contar_valores_nao_zero(df_bruto, linhas_alunos, idx):
 
 
 def descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx):
-    """
-    Descobre o índice da coluna AE combinando:
-      1) posição calculada (first_note_idx + 3)
-      2) cabeçalho do PDF (procura 'AE' nas primeiras linhas)
-    Se os dois divergirem, escolhe a coluna com MAIS valores não-zero entre os
-    alunos — a AE tem notas altas; ND/RECUP têm 00.00.
-    """
     n_cols = df_bruto.shape[1]
     idx_posicional = first_note_idx + 3
 
@@ -137,7 +125,6 @@ def descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx):
     if len(candidatos) == 1:
         return candidatos[0][1]
 
-    # Desempate por densidade de valores > 0
     candidatos_com_score = [
         (label, idx, contar_valores_nao_zero(df_bruto, linhas_alunos, idx))
         for label, idx in candidatos
@@ -147,7 +134,6 @@ def descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx):
 
 
 def extrair_tabela_notas(df_bruto):
-    """Extrai notas dos alunos."""
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
         primeira = str(row.iloc[0]).strip()
@@ -165,7 +151,6 @@ def extrair_tabela_notas(df_bruto):
     if n_notas > n_cols - 2:
         n_notas = 7
     first_note_idx = n_cols - n_notas
-
     ae_idx = descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx)
 
     def safe_get(row, idx):
@@ -179,7 +164,6 @@ def extrair_tabela_notas(df_bruto):
         nome = str(row.iloc[2]).strip()
         if not matricula:
             continue
-
         reg = {"MATRICULA": matricula, "NOME": nome}
         reg["AP1/AV1"]       = safe_get(row, first_note_idx + 0)
         reg["AP2/AV2"]       = safe_get(row, first_note_idx + 1)
@@ -188,7 +172,6 @@ def extrair_tabela_notas(df_bruto):
         reg["ND"]            = safe_get(row, first_note_idx + 4)
         reg["TOTAL PARCIAL"] = safe_get(row, n_cols - 2)
         reg["FINAL"]         = safe_get(row, n_cols - 1)
-
         registros.append(reg)
 
     return pd.DataFrame(registros) if registros else None
@@ -205,110 +188,98 @@ def eh_tabela_de_notas(df_bruto):
 def _tentar_flavor(tmp_path: str, **kwargs):
     try:
         tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
-    except Exception:
-        return {}, 0
+    except Exception as e:
+        return {"erro": str(e), "notas": {}, "tabelas": [], "n_notas_max": 0}
+
     notas = {}
     n_notas_max = 0
-    for t in tabs:
-        if not eh_tabela_de_notas(t.df):
+    tabelas_info = []
+    for i, t in enumerate(tabs):
+        df = t.df
+        n_cols = df.shape[1]
+        n_notas = contar_colunas_notas(df)
+        first_note_idx = n_cols - n_notas
+
+        idx_header = None
+        for r in range(min(20, len(df))):
+            for j in range(n_cols):
+                if normalizar_celula(df.iloc[r, j]) == "AE":
+                    idx_header = j
+                    break
+            if idx_header is not None:
+                break
+
+        eh_tab = eh_tabela_de_notas(df)
+        tabelas_info.append({
+            "indice": i,
+            "shape": df.shape,
+            "n_notas_detectado": n_notas,
+            "first_note_idx": first_note_idx,
+            "AE_idx_posicional": first_note_idx + 3,
+            "AE_idx_cabecalho": idx_header,
+            "eh_tabela_notas": eh_tab,
+        })
+        if not eh_tab:
             continue
-        n_notas = contar_colunas_notas(t.df)
-        df = extrair_tabela_notas(t.df)
-        if df is None:
+        df_alunos = extrair_tabela_notas(df)
+        if df_alunos is None:
             continue
-        for _, row in df.iterrows():
+        for _, row in df_alunos.iterrows():
             notas[row["MATRICULA"]] = row.to_dict()
         n_notas_max = max(n_notas_max, n_notas)
-    return notas, n_notas_max
+
+    return {"erro": None, "notas": notas, "tabelas": tabelas_info, "n_notas_max": n_notas_max}
 
 
 @st.cache_data(show_spinner=False)
+def processar_pdf(pdf_bytes: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+    try:
+        configs = [
+            ("lattice_40", {"flavor": "lattice", "line_scale": 40}),
+            ("stream",     {"flavor": "stream",  "strip_text": "\n"}),
+        ]
+        debug = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futuros = {
+                ex.submit(_tentar_flavor, tmp_path, **kwargs): label
+                for label, kwargs in configs
+            }
+            for fut in concurrent.futures.as_completed(futuros):
+                label = futuros[fut]
+                try:
+                    debug[label] = fut.result()
+                except Exception as e:
+                    debug[label] = {"erro": str(e), "notas": {}, "tabelas": [], "n_notas_max": 0}
+
+        l40 = debug.get("lattice_40", {})
+        if l40.get("notas") and len(l40["notas"]) >= 20:
+            return {"notas": l40["notas"], "debug": debug, "vencedor": "lattice_40"}
+
+        opcoes = [
+            (label, len(d.get("notas", {})), d.get("n_notas_max", 0), d.get("notas", {}))
+            for label, d in debug.items() if d.get("notas")
+        ]
+        if not opcoes:
+            return {"notas": {}, "debug": debug, "vencedor": None}
+        opcoes.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        vencedor = opcoes[0][0]
+        return {"notas": opcoes[0][3], "debug": debug, "vencedor": vencedor}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
-    try:
-        tentativas = [
-            ("lattice_40", {"flavor": "lattice", "line_scale": 40}),
-            ("lattice_15", {"flavor": "lattice"}),
-            ("stream",     {"flavor": "stream",  "strip_text": "\n"}),
-        ]
-        resultados = []
-        for label, kwargs in tentativas:
-            notas, n_notas = _tentar_flavor(tmp_path, **kwargs)
-            if notas:
-                resultados.append((label, len(notas), n_notas, notas))
-
-        if not resultados:
-            return {}
-
-        # Preferir lattice_40 se achou >= 20 alunos (tabela completa)
-        for label, n_alunos, n_notas, notas in resultados:
-            if label == "lattice_40" and n_alunos >= 20:
-                return notas
-
-        # Senão, quem tiver mais alunos (desempate: mais colunas de notas)
-        resultados.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        return resultados[0][3]
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+    return processar_pdf(pdf_bytes).get("notas", {})
 
 
-@st.cache_data(show_spinner=False)
-def depurar_pdf(pdf_bytes: bytes):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-
-    try:
-        resultado = {}
-        tentativas = [
-            ("lattice_40", {"flavor": "lattice", "line_scale": 40}),
-            ("lattice_15", {"flavor": "lattice"}),
-            ("stream",     {"flavor": "stream",  "strip_text": "\n"}),
-        ]
-        for label, kwargs in tentativas:
-            try:
-                tabs = camelot.read_pdf(tmp_path, pages="all", **kwargs)
-            except Exception as e:
-                resultado[label] = {"erro": str(e), "tabelas": []}
-                continue
-
-            info_tabs = []
-            for i, t in enumerate(tabs):
-                df = t.df
-                n_cols = df.shape[1]
-                n_notas = contar_colunas_notas(df)
-                first_note_idx = n_cols - n_notas
-                # cabeçalho
-                idx_header = None
-                for r in range(min(20, len(df))):
-                    for j in range(n_cols):
-                        if normalizar_celula(df.iloc[r, j]) == "AE":
-                            idx_header = j
-                            break
-                    if idx_header is not None:
-                        break
-                info_tabs.append({
-                    "indice": i,
-                    "shape": df.shape,
-                    "n_notas_detectado": n_notas,
-                    "first_note_idx": first_note_idx,
-                    "AE_idx_posicional": first_note_idx + 3,
-                    "AE_idx_cabecalho": idx_header,
-                    "eh_tabela_notas": eh_tabela_de_notas(df),
-                })
-            resultado[label] = {"erro": None, "tabelas": info_tabs}
-        return resultado
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+def depurar_pdf(pdf_bytes: bytes) -> dict:
+    return processar_pdf(pdf_bytes).get("debug", {})
 
 
 def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
@@ -359,7 +330,6 @@ def gerar_planilha_modelo() -> bytes:
 # ETAPA 1 — Upload da planilha
 # ---------------------------------------------------------------------------
 st.header("1️⃣ Lista de solicitações")
-
 st.warning(
     "⚠️ **ATENÇÃO** — A planilha deve conter **SOMENTE** as colunas do modelo abaixo.\n\n"
     "Colunas extras (filtros, observações, notas antigas, 'Disciplina anterior', etc.) "
@@ -502,85 +472,81 @@ st.dataframe(df_resumo, use_container_width=True, hide_index=True)
 st.caption(f"📊 {len(solicitacoes)} solicitação(ões) em {len(necessarios)} diário(s).")
 
 # ---------------------------------------------------------------------------
-# ETAPA 3 — Seleção de turmas + uploads
+# ETAPA 3 — Seleção de UMA turma + uploads
 # ---------------------------------------------------------------------------
-st.header("3️⃣ Selecione as turmas que você vai verificar")
+st.header("3️⃣ Escolha a turma que você vai verificar")
+st.markdown(
+    "Selecione **uma turma por vez**. O app processa apenas os diários "
+    "dessa turma — fica mais rápido e facilita isolar eventuais problemas. "
+    "Depois é só trocar a turma no seletor e rodar de novo."
+)
 
 turmas = sorted(set(s["turma"] for s in solicitacoes))
 
-if f"turmas_sel_{excel_hash}" not in st.session_state:
-    st.session_state[f"turmas_sel_{excel_hash}"] = []
+# Reset do selectbox quando muda a planilha
+select_key = f"turma_sel_{excel_hash}"
+if select_key not in st.session_state:
+    st.session_state[select_key] = "—"
 
-c1, c2, _ = st.columns([1, 1, 4])
-with c1:
-    if st.button("✅ Marcar todas", use_container_width=True):
-        for t in turmas:
-            st.session_state[f"chk_{excel_hash}_{t}"] = True
-        st.rerun()
-with c2:
-    if st.button("🧹 Limpar", use_container_width=True):
-        for t in turmas:
-            st.session_state[f"chk_{excel_hash}_{t}"] = False
-        st.rerun()
+opcoes = ["—"] + turmas
+turma_escolhida = st.selectbox(
+    "Turma a processar",
+    opcoes,
+    key=select_key,
+    help="Escolha a turma cujos diários você vai enviar agora.",
+)
 
-diarios_carregados = {}
-turmas_marcadas = []
-
-for turma in turmas:
-    discs_turma = sorted(
-        [(c, d) for (t, c), d in necessarios.items() if t == turma],
-        key=lambda x: x[1]["nome"],
-    )
-    qtd_sol = sum(d["qtd"] for _, d in discs_turma)
-
-    with st.expander(
-        f"📘 Turma {turma} — {len(discs_turma)} diário(s) • {qtd_sol} solicitação(ões)",
-        expanded=False,
-    ):
-        marcar = st.checkbox(
-            "Caso deseje verificar os diários dessa turma, marque aqui",
-            key=f"chk_{excel_hash}_{turma}",
-        )
-        if marcar:
-            turmas_marcadas.append(turma)
-            cols = st.columns(min(len(discs_turma), 3)) if len(discs_turma) > 1 else [st]
-            for idx, (code, info) in enumerate(discs_turma):
-                container = cols[idx % len(cols)]
-                with container:
-                    st.markdown(
-                        f"**{info['nome']}**  \n"
-                        f"<small>{info['qtd']} solicitação(ões) — código {code or '—'}</small>",
-                        unsafe_allow_html=True,
-                    )
-                    up = st.file_uploader(
-                        f"Upload {info['nome']} (turma {turma})",
-                        type=["pdf"],
-                        key=f"pdf_{excel_hash}_{turma}_{code}",
-                        label_visibility="collapsed",
-                    )
-                    if up is not None:
-                        diarios_carregados[(turma, code)] = {
-                            "arquivo": up, "nome": info["nome"],
-                        }
-
-st.session_state[f"turmas_sel_{excel_hash}"] = turmas_marcadas
-
-if not turmas_marcadas:
-    st.info("☝️ Marque ao menos uma turma acima para liberar os uploads.")
+if turma_escolhida == "—":
+    st.info("☝️ Escolha uma turma no seletor acima para liberar os uploads.")
     st.stop()
 
-total_necessarios_sel = sum(1 for (t, c) in necessarios.keys() if t in turmas_marcadas)
+st.success(f"🎯 Turma selecionada: **{turma_escolhida}**")
+
+# Monta lista de diários só da turma escolhida
+discs_turma = sorted(
+    [(c, d) for (t, c), d in necessarios.items() if t == turma_escolhida],
+    key=lambda x: x[1]["nome"],
+)
+qtd_sol_turma = sum(d["qtd"] for _, d in discs_turma)
+
+st.markdown(
+    f"### Diários da turma {turma_escolhida} — "
+    f"{len(discs_turma)} diário(s) • {qtd_sol_turma} solicitação(ões)"
+)
+
+diarios_carregados = {}
+cols = st.columns(min(len(discs_turma), 3)) if len(discs_turma) > 1 else [st]
+for idx, (code, info) in enumerate(discs_turma):
+    container = cols[idx % len(cols)]
+    with container:
+        st.markdown(
+            f"**{info['nome']}**  \n"
+            f"<small>{info['qtd']} solicitação(ões) — código {code or '—'}</small>",
+            unsafe_allow_html=True,
+        )
+        up = st.file_uploader(
+            f"Upload {info['nome']} (turma {turma_escolhida})",
+            type=["pdf"],
+            key=f"pdf_{excel_hash}_{turma_escolhida}_{code}",
+            label_visibility="collapsed",
+        )
+        if up is not None:
+            diarios_carregados[(turma_escolhida, code)] = {
+                "arquivo": up, "nome": info["nome"],
+            }
+
+total_necessarios_sel = len(discs_turma)
 faltando = total_necessarios_sel - len(diarios_carregados)
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Turmas marcadas", len(turmas_marcadas))
-c2.metric("Diários esperados", total_necessarios_sel)
-c3.metric("Diários carregados", len(diarios_carregados))
+c1.metric("Diários esperados", total_necessarios_sel)
+c2.metric("Diários carregados", len(diarios_carregados))
+c3.metric("Faltando", max(0, faltando))
 
 if faltando > 0:
     st.warning(f"⚠️ Faltam **{faltando}** diário(s).")
 else:
-    st.success("✅ Todos os diários foram enviados!")
+    st.success("✅ Todos os diários da turma foram enviados!")
 
 # ---------------------------------------------------------------------------
 # ETAPA 4 — Verificação
@@ -589,16 +555,23 @@ st.header("4️⃣ Rodar verificação")
 
 if st.button("▶️ Rodar verificação", type="primary"):
 
-    solicitacoes_sel = [s for s in solicitacoes if s["turma"] in turmas_marcadas]
+    solicitacoes_sel = [s for s in solicitacoes if s["turma"] == turma_escolhida]
 
     diarios_notas = {}
-    with st.spinner("Lendo diários..."):
-        for (turma, code), info in diarios_carregados.items():
+    total_diarios = len(diarios_carregados)
+    if total_diarios > 0:
+        progresso = st.progress(0, text="Preparando leitura dos PDFs...")
+        for i, ((turma, code), info) in enumerate(diarios_carregados.items(), start=1):
+            progresso.progress(
+                i / total_diarios,
+                text=f"Lendo {i}/{total_diarios} — {info['nome']}"
+            )
             try:
                 notas = extrair_notas_pdf(info["arquivo"].getvalue())
                 diarios_notas[(turma, code)] = notas
             except Exception as e:
                 st.warning(f"⚠️ Erro em {turma}/{info['nome']}: {e}")
+        progresso.empty()
 
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["disciplina_code"])
@@ -627,7 +600,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
         })
     df_long = (
         pd.DataFrame(linhas_long)
-        .sort_values(by=["Turma", "Nome do Aluno", "Disciplina"])
+        .sort_values(by=["Nome do Aluno", "Disciplina"])
         .reset_index(drop=True)
     )
 
@@ -659,12 +632,12 @@ if st.button("▶️ Rodar verificação", type="primary"):
 
     df_wide = (
         pd.DataFrame(linhas_wide)
-        .sort_values(by=["Turma", "Nome do Aluno"])
+        .sort_values(by=["Nome do Aluno"])
         .reset_index(drop=True)
     )
 
     st.markdown("---")
-    st.subheader("📈 Resumo")
+    st.subheader(f"📈 Resumo — Turma {turma_escolhida}")
     total_sol = len(solicitacoes_sel)
     total_sim = sum(1 for s in solicitacoes_sel if s["status"] == "Sim")
     total_nao = sum(1 for s in solicitacoes_sel if s["status"] == "Não")
@@ -679,19 +652,16 @@ if st.button("▶️ Rodar verificação", type="primary"):
     c5.metric("👤 Sem aluno", total_sem_aluno)
 
     st.markdown("---")
-    tab1, tab2 = st.tabs(["📊 Por solicitação", "📋 Por turma (por aluno)"])
+    tab1, tab2 = st.tabs(["📊 Por solicitação", "📋 Por aluno"])
     with tab1:
         st.dataframe(df_long, use_container_width=True, hide_index=True)
     with tab2:
-        for turma in sorted(df_wide["Turma"].unique()):
-            grupo = df_wide[df_wide["Turma"] == turma].reset_index(drop=True)
-            st.markdown(f"### Turma {turma}")
-            st.dataframe(grupo, use_container_width=True, hide_index=True)
+        st.dataframe(df_wide, use_container_width=True, hide_index=True)
 
     with st.expander("🔎 Depuração da leitura dos PDFs (clique para abrir)"):
-        st.caption("Mostra o que o Camelot extraiu, com 3 configurações.")
+        st.caption("Cada PDF é processado uma única vez, com 2 configs em paralelo.")
         for (turma, code), info in diarios_carregados.items():
-            st.markdown(f"### Turma {turma} — {info['nome']} (código {code})")
+            st.markdown(f"### {info['nome']} (código {code})")
             notas_diario = diarios_notas.get((turma, code), {})
             st.write(f"**Alunos encontrados:** {len(notas_diario)}")
             try:
@@ -718,19 +688,18 @@ if st.button("▶️ Rodar verificação", type="primary"):
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_long.to_excel(writer, sheet_name="Todas as Turmas", index=False)
-        aplicar_formatacao_excel(writer, "Todas as Turmas", "Lançou a Nota?")
-        for turma in sorted(df_wide["Turma"].unique()):
-            grupo = df_wide[df_wide["Turma"] == turma].copy()
-            sheet_name = f"Turma {turma}"[:31]
-            grupo.to_excel(writer, sheet_name=sheet_name, index=False)
-            for i in range(1, 5):
-                col_status = f"Lançou a Nota da {i}ª Disciplina? (Sim / Não)"
-                aplicar_formatacao_excel(writer, sheet_name, col_status)
+        df_long.to_excel(writer, sheet_name=f"Turma {turma_escolhida}"[:31], index=False)
+        aplicar_formatacao_excel(writer, f"Turma {turma_escolhida}"[:31], "Lançou a Nota?")
+        # Aba formato largo (por aluno)
+        sheet_wide = f"Turma {turma_escolhida} (aluno)"[:31]
+        df_wide.to_excel(writer, sheet_name=sheet_wide, index=False)
+        for i in range(1, 5):
+            col_status = f"Lançou a Nota da {i}ª Disciplina? (Sim / Não)"
+            aplicar_formatacao_excel(writer, sheet_wide, col_status)
 
     st.download_button(
-        label="📥 Baixar resultado da varredura (Excel)",
+        label=f"📥 Baixar resultado da turma {turma_escolhida} (Excel)",
         data=output.getvalue(),
-        file_name="resultado_varredura_avaliacao_especial.xlsx",
+        file_name=f"resultado_varredura_turma_{turma_escolhida}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
