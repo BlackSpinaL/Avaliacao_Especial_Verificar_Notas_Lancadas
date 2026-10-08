@@ -44,6 +44,11 @@ def normalizar(s):
     return s
 
 
+def normalizar_nome(s):
+    """Normaliza nome para comparação: sem acento, sem espaço extra."""
+    return normalizar(s)
+
+
 def normalizar_celula(celula):
     if celula is None:
         return ""
@@ -160,10 +165,19 @@ def extrair_tabela_notas(df_bruto):
 
     registros = []
     for row in linhas_alunos:
-        matricula = re.sub(r"\D", "", str(row.iloc[1]))
+        # Tenta matrícula em iloc[1]; se vier vazio, tenta iloc[2] e usa o nome de iloc[3]
+        matricula_raw = str(row.iloc[1]).strip()
+        matricula = re.sub(r"\D", "", matricula_raw)
         nome = str(row.iloc[2]).strip()
+
+        if not matricula:
+            # fallback: talvez o Camelot tenha deslocado colunas
+            matricula = re.sub(r"\D", "", str(row.iloc[2]))
+            nome = str(row.iloc[3]).strip() if len(row) > 3 else ""
+
         if not matricula:
             continue
+
         reg = {"MATRICULA": matricula, "NOME": nome}
         reg["AP1/AV1"]       = safe_get(row, first_note_idx + 0)
         reg["AP2/AV2"]       = safe_get(row, first_note_idx + 1)
@@ -280,6 +294,35 @@ def extrair_notas_pdf(pdf_bytes: bytes) -> dict:
 
 def depurar_pdf(pdf_bytes: bytes) -> dict:
     return processar_pdf(pdf_bytes).get("debug", {})
+
+
+def encontrar_aluno(notas: dict, matricula: str, nome: str):
+    """
+    Procura o aluno em `notas` por 3 estratégias:
+      1) match exato de matrícula
+      2) match flexível (lstrip de zeros) de matrícula
+      3) match por nome normalizado
+    Devolve o dict de notas ou None.
+    """
+    # 1) exato
+    if matricula in notas:
+        return notas[matricula]
+
+    # 2) lstrip de zeros
+    mat_limpa = matricula.lstrip("0")
+    for m, n in notas.items():
+        if m.lstrip("0") == mat_limpa:
+            return n
+
+    # 3) por nome normalizado
+    nome_norm = normalizar_nome(nome)
+    if not nome_norm:
+        return None
+    for m, n in notas.items():
+        nome_pdf = normalizar_nome(n.get("NOME", ""))
+        if nome_pdf and nome_pdf == nome_norm:
+            return n
+    return None
 
 
 def aplicar_formatacao_excel(writer, sheet_name, coluna_status):
@@ -477,13 +520,11 @@ st.caption(f"📊 {len(solicitacoes)} solicitação(ões) em {len(necessarios)} 
 st.header("3️⃣ Escolha a turma que você vai verificar")
 st.markdown(
     "Selecione **uma turma por vez**. O app processa apenas os diários "
-    "dessa turma — fica mais rápido e facilita isolar eventuais problemas. "
-    "Depois é só trocar a turma no seletor e rodar de novo."
+    "dessa turma — fica mais rápido e facilita isolar eventuais problemas."
 )
 
 turmas = sorted(set(s["turma"] for s in solicitacoes))
 
-# Reset do selectbox quando muda a planilha
 select_key = f"turma_sel_{excel_hash}"
 if select_key not in st.session_state:
     st.session_state[select_key] = "—"
@@ -502,7 +543,6 @@ if turma_escolhida == "—":
 
 st.success(f"🎯 Turma selecionada: **{turma_escolhida}**")
 
-# Monta lista de diários só da turma escolhida
 discs_turma = sorted(
     [(c, d) for (t, c), d in necessarios.items() if t == turma_escolhida],
     key=lambda x: x[1]["nome"],
@@ -573,21 +613,31 @@ if st.button("▶️ Rodar verificação", type="primary"):
                 st.warning(f"⚠️ Erro em {turma}/{info['nome']}: {e}")
         progresso.empty()
 
+    # Estatísticas de match para o painel de depuração
+    match_stats = {}  # (turma, code) -> {"exato": N, "flex": N, "nome": N, "falha": N}
+
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["disciplina_code"])
         if key not in diarios_notas:
             sol["status"] = "Diário não enviado"
             continue
         notas = diarios_notas[key]
-        n_aluno = notas.get(sol["matricula"])
-        if n_aluno is None:
-            for mat, n in notas.items():
-                if mat.lstrip("0") == sol["matricula"].lstrip("0"):
-                    n_aluno = n
-                    break
+        n_aluno = encontrar_aluno(notas, sol["matricula"], sol["nome"])
         if n_aluno is None:
             sol["status"] = "Aluno não encontrado"
+            match_stats.setdefault(key, {"exato": 0, "flex": 0, "nome": 0, "falha": 0})
+            match_stats[key]["falha"] += 1
         else:
+            # Classifica o tipo de match (só para debug)
+            if sol["matricula"] in notas:
+                tipo = "exato"
+            elif any(m.lstrip("0") == sol["matricula"].lstrip("0") for m in notas):
+                tipo = "flex"
+            else:
+                tipo = "nome"
+            match_stats.setdefault(key, {"exato": 0, "flex": 0, "nome": 0, "falha": 0})
+            match_stats[key][tipo] += 1
+
             ae = n_aluno.get("AE", "")
             sol["status"] = "Não" if valor_em_branco(ae) else "Sim"
 
@@ -663,7 +713,23 @@ if st.button("▶️ Rodar verificação", type="primary"):
         for (turma, code), info in diarios_carregados.items():
             st.markdown(f"### {info['nome']} (código {code})")
             notas_diario = diarios_notas.get((turma, code), {})
-            st.write(f"**Alunos encontrados:** {len(notas_diario)}")
+            st.write(f"**Alunos encontrados no PDF:** {len(notas_diario)}")
+
+            # Estatísticas de match
+            st_diario = match_stats.get((turma, code))
+            if st_diario:
+                st.write(
+                    f"**Matches** — exato: {st_diario['exato']} • "
+                    f"flex (lstrip 0): {st_diario['flex']} • "
+                    f"por nome: {st_diario['nome']} • "
+                    f"falhas: {st_diario['falha']}"
+                )
+
+            # Lista de matrículas extraídas (para conferência manual)
+            if notas_diario:
+                amostra = list(notas_diario.keys())
+                st.write(f"**Matrículas extraídas ({len(amostra)}):** {amostra}")
+
             try:
                 dbg = depurar_pdf(info["arquivo"].getvalue())
             except Exception as e:
@@ -690,7 +756,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_long.to_excel(writer, sheet_name=f"Turma {turma_escolhida}"[:31], index=False)
         aplicar_formatacao_excel(writer, f"Turma {turma_escolhida}"[:31], "Lançou a Nota?")
-        # Aba formato largo (por aluno)
         sheet_wide = f"Turma {turma_escolhida} (aluno)"[:31]
         df_wide.to_excel(writer, sheet_name=sheet_wide, index=False)
         for i in range(1, 5):
