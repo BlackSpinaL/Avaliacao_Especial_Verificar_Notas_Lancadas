@@ -45,7 +45,6 @@ def normalizar(s):
 
 
 def normalizar_nome(s):
-    """Normaliza nome para comparação: sem acento, sem espaço extra."""
     return normalizar(s)
 
 
@@ -138,12 +137,66 @@ def descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx):
     return candidatos_com_score[0][1]
 
 
+def _parece_linha_aluno(celula):
+    s = str(celula).strip()
+    return bool(re.match(r"^\d{1,3}(\s+\d{4,})?$", s))
+
+
+def _detectar_aluno_na_linha(row, n_cols):
+    """
+    Tenta achar (matrícula, nome) em várias posições.
+    Formatos cobertos:
+      A) row[0]='001', row[1]='142813', row[2]='NOME'
+      B) row[0]='001 142813', row[1]='NOME'
+      C) row[0]='001', row[1]='142813 NOME COMPLETO'
+      D) row[0]='001', row[1]='', row[2]='142813', row[3]='NOME'
+    """
+    # Extrai todas as células como string
+    cels = [str(row.iloc[i]).strip() if i < n_cols else "" for i in range(min(n_cols, 6))]
+
+    # Junta tudo em uma string para busca
+    linha_str = " ".join(cels)
+
+    # Procura padrão "NÚMERO DE CHAMADA" (1-3 dígitos) no início
+    m_chamada = re.match(r"^(\d{1,3})\b", cels[0])
+    if not m_chamada and len(cels) > 1 and re.match(r"^\d{1,3}$", cels[1]):
+        # Caso raro: chamada caiu na coluna 1
+        m_chamada = re.match(r"^(\d{1,3})$", cels[1])
+        chamada_col = 1
+    else:
+        chamada_col = 0
+
+    if not m_chamada:
+        return None, None
+
+    # A partir da chamada, procura a matrícula (5-6 dígitos) nas próximas células
+    for j in range(chamada_col + 1, min(chamada_col + 4, len(cels))):
+        c = cels[j]
+        # Formato A/B/D: matrícula pura
+        m = re.match(r"^(\d{5,6})$", c)
+        if m:
+            # Nome pode estar na próxima célula
+            nome = cels[j + 1] if j + 1 < len(cels) else ""
+            return m.group(1), nome
+        # Formato C: "142813 NOME COMPLETO"
+        m = re.match(r"^(\d{5,6})\s+(.+)$", c)
+        if m:
+            return m.group(1), m.group(2).strip()
+        # Formato combinado: "001 142813" na própria célula
+        m = re.match(r"^\d{1,3}\s+(\d{5,6})$", c)
+        if m:
+            nome = cels[j + 1] if j + 1 < len(cels) else ""
+            return m.group(1), nome
+
+    return None, None
+
+
 def extrair_tabela_notas(df_bruto):
     linhas_alunos = []
     for _, row in df_bruto.iterrows():
-        primeira = str(row.iloc[0]).strip()
-        if re.match(r"^\d{1,3}$", primeira):
-            linhas_alunos.append(row)
+        matricula, nome = _detectar_aluno_na_linha(row, df_bruto.shape[1])
+        if matricula:
+            linhas_alunos.append((row, matricula, nome))
 
     if not linhas_alunos:
         return None
@@ -156,7 +209,7 @@ def extrair_tabela_notas(df_bruto):
     if n_notas > n_cols - 2:
         n_notas = 7
     first_note_idx = n_cols - n_notas
-    ae_idx = descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx)
+    ae_idx = descobrir_ae_idx(df_bruto, [t[0] for t in linhas_alunos], first_note_idx)
 
     def safe_get(row, idx):
         if idx is None or idx < 0 or idx >= n_cols:
@@ -164,20 +217,9 @@ def extrair_tabela_notas(df_bruto):
         return row.iloc[idx]
 
     registros = []
-    for row in linhas_alunos:
-        # Tenta matrícula em iloc[1]; se vier vazio, tenta iloc[2] e usa o nome de iloc[3]
-        matricula_raw = str(row.iloc[1]).strip()
-        matricula = re.sub(r"\D", "", matricula_raw)
-        nome = str(row.iloc[2]).strip()
-
-        if not matricula:
-            # fallback: talvez o Camelot tenha deslocado colunas
-            matricula = re.sub(r"\D", "", str(row.iloc[2]))
-            nome = str(row.iloc[3]).strip() if len(row) > 3 else ""
-
+    for row, matricula, nome in linhas_alunos:
         if not matricula:
             continue
-
         reg = {"MATRICULA": matricula, "NOME": nome}
         reg["AP1/AV1"]       = safe_get(row, first_note_idx + 0)
         reg["AP2/AV2"]       = safe_get(row, first_note_idx + 1)
@@ -192,11 +234,26 @@ def extrair_tabela_notas(df_bruto):
 
 
 def eh_tabela_de_notas(df_bruto):
+    """
+    Detecção relaxada:
+      1) Se tem >= 2 marcadores de cabeçalho conhecidos: aceita.
+      2) Senão, se tem >= 5 matrículas únicas (5-6 dígitos) E >= 20 notas XX.XX: aceita.
+    """
     texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
     texto_norm = re.sub(r"\s+", "", texto)
+
     marcadores = ["AP1/AV1", "AV1/AP1", "AP1AV1", "AV1AP1",
                   "AP2/AS", "AP2/AV2", "TOTALPARCIAL"]
-    return sum(1 for m in marcadores if m in texto_norm) >= 2
+    if sum(1 for m in marcadores if m in texto_norm) >= 2:
+        return True
+
+    # Fallback estrutural
+    matriculas = set(re.findall(r"\b\d{5,6}\b", texto))
+    notas_xx = re.findall(r"\b\d{2}\.\d{2}\b", texto)
+    if len(matriculas) >= 5 and len(notas_xx) >= 20:
+        return True
+
+    return False
 
 
 def _tentar_flavor(tmp_path: str, **kwargs):
@@ -224,6 +281,9 @@ def _tentar_flavor(tmp_path: str, **kwargs):
                 break
 
         eh_tab = eh_tabela_de_notas(df)
+        texto = " ".join(str(v) for v in df.values.flatten())
+        n_matriculas = len(set(re.findall(r"\b\d{5,6}\b", texto)))
+
         tabelas_info.append({
             "indice": i,
             "shape": df.shape,
@@ -232,6 +292,7 @@ def _tentar_flavor(tmp_path: str, **kwargs):
             "AE_idx_posicional": first_note_idx + 3,
             "AE_idx_cabecalho": idx_header,
             "eh_tabela_notas": eh_tab,
+            "n_matriculas": n_matriculas,
         })
         if not eh_tab:
             continue
@@ -268,10 +329,7 @@ def processar_pdf(pdf_bytes: bytes) -> dict:
                 except Exception as e:
                     debug[label] = {"erro": str(e), "notas": {}, "tabelas": [], "n_notas_max": 0}
 
-        l40 = debug.get("lattice_40", {})
-        if l40.get("notas") and len(l40["notas"]) >= 20:
-            return {"notas": l40["notas"], "debug": debug, "vencedor": "lattice_40"}
-
+        # Escolhe o flavor com MAIS alunos (desempate: mais colunas de notas)
         opcoes = [
             (label, len(d.get("notas", {})), d.get("n_notas_max", 0), d.get("notas", {}))
             for label, d in debug.items() if d.get("notas")
@@ -279,8 +337,7 @@ def processar_pdf(pdf_bytes: bytes) -> dict:
         if not opcoes:
             return {"notas": {}, "debug": debug, "vencedor": None}
         opcoes.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        vencedor = opcoes[0][0]
-        return {"notas": opcoes[0][3], "debug": debug, "vencedor": vencedor}
+        return {"notas": opcoes[0][3], "debug": debug, "vencedor": opcoes[0][0]}
     finally:
         try:
             os.unlink(tmp_path)
@@ -297,30 +354,20 @@ def depurar_pdf(pdf_bytes: bytes) -> dict:
 
 
 def encontrar_aluno(notas: dict, matricula: str, nome: str):
-    """
-    Procura o aluno em `notas` por 3 estratégias:
-      1) match exato de matrícula
-      2) match flexível (lstrip de zeros) de matrícula
-      3) match por nome normalizado
-    Devolve o dict de notas ou None.
-    """
-    # 1) exato
+    """Procura por matrícula exata, flexível e por nome normalizado."""
     if matricula in notas:
         return notas[matricula]
 
-    # 2) lstrip de zeros
     mat_limpa = matricula.lstrip("0")
     for m, n in notas.items():
         if m.lstrip("0") == mat_limpa:
             return n
 
-    # 3) por nome normalizado
     nome_norm = normalizar_nome(nome)
     if not nome_norm:
         return None
     for m, n in notas.items():
-        nome_pdf = normalizar_nome(n.get("NOME", ""))
-        if nome_pdf and nome_pdf == nome_norm:
+        if normalizar_nome(n.get("NOME", "")) == nome_norm:
             return n
     return None
 
@@ -613,8 +660,7 @@ if st.button("▶️ Rodar verificação", type="primary"):
                 st.warning(f"⚠️ Erro em {turma}/{info['nome']}: {e}")
         progresso.empty()
 
-    # Estatísticas de match para o painel de depuração
-    match_stats = {}  # (turma, code) -> {"exato": N, "flex": N, "nome": N, "falha": N}
+    match_stats = {}
 
     for sol in solicitacoes_sel:
         key = (sol["turma"], sol["disciplina_code"])
@@ -628,7 +674,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
             match_stats.setdefault(key, {"exato": 0, "flex": 0, "nome": 0, "falha": 0})
             match_stats[key]["falha"] += 1
         else:
-            # Classifica o tipo de match (só para debug)
             if sol["matricula"] in notas:
                 tipo = "exato"
             elif any(m.lstrip("0") == sol["matricula"].lstrip("0") for m in notas):
@@ -715,7 +760,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
             notas_diario = diarios_notas.get((turma, code), {})
             st.write(f"**Alunos encontrados no PDF:** {len(notas_diario)}")
 
-            # Estatísticas de match
             st_diario = match_stats.get((turma, code))
             if st_diario:
                 st.write(
@@ -725,7 +769,6 @@ if st.button("▶️ Rodar verificação", type="primary"):
                     f"falhas: {st_diario['falha']}"
                 )
 
-            # Lista de matrículas extraídas (para conferência manual)
             if notas_diario:
                 amostra = list(notas_diario.keys())
                 st.write(f"**Matrículas extraídas ({len(amostra)}):** {amostra}")
@@ -742,7 +785,8 @@ if st.button("▶️ Rodar verificação", type="primary"):
                 for t in res["tabelas"]:
                     st.write(
                         f"- Tabela #{t['indice']} — shape={t['shape']} — "
-                        f"é tabela de notas? **{t['eh_tabela_notas']}**"
+                        f"é tabela de notas? **{t['eh_tabela_notas']}** — "
+                        f"matrículas: **{t.get('n_matriculas', 0)}**"
                     )
                     st.write(
                         f"  - colunas de notas detectadas: **{t['n_notas_detectado']}**"
