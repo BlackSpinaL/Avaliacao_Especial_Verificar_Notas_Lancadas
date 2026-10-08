@@ -137,56 +137,45 @@ def descobrir_ae_idx(df_bruto, linhas_alunos, first_note_idx):
     return candidatos_com_score[0][1]
 
 
-def _parece_linha_aluno(celula):
-    s = str(celula).strip()
-    return bool(re.match(r"^\d{1,3}(\s+\d{4,})?$", s))
-
-
 def _detectar_aluno_na_linha(row, n_cols):
     """
-    Tenta achar (matrícula, nome) em várias posições.
-    Formatos cobertos:
-      A) row[0]='001', row[1]='142813', row[2]='NOME'
-      B) row[0]='001 142813', row[1]='NOME'
-      C) row[0]='001', row[1]='142813 NOME COMPLETO'
-      D) row[0]='001', row[1]='', row[2]='142813', row[3]='NOME'
+    Detecta (matrícula, nome) na linha, cobrindo vários formatos do Camelot:
+      A) cels = ["001", "142813", "NOME", ...]
+      B) cels = ["001 142813", "NOME", ...]
+      C) cels = ["001", "142813 NOME", ...]
+      D) cels = ["001", "", "142813", "NOME", ...]
     """
-    # Extrai todas as células como string
     cels = [str(row.iloc[i]).strip() if i < n_cols else "" for i in range(min(n_cols, 6))]
+    c0 = cels[0] if len(cels) > 0 else ""
+    c1 = cels[1] if len(cels) > 1 else ""
+    c2 = cels[2] if len(cels) > 2 else ""
+    c3 = cels[3] if len(cels) > 3 else ""
 
-    # Junta tudo em uma string para busca
-    linha_str = " ".join(cels)
+    # Formato B: c0 = "001 142813" (chamada + matrícula juntas)
+    m = re.match(r"^(\d{1,3})\s+(\d{5,6})\b\s*(.*)$", c0)
+    if m:
+        nome = m.group(3).strip() or c1
+        return m.group(2), nome
 
-    # Procura padrão "NÚMERO DE CHAMADA" (1-3 dígitos) no início
-    m_chamada = re.match(r"^(\d{1,3})\b", cels[0])
-    if not m_chamada and len(cels) > 1 and re.match(r"^\d{1,3}$", cels[1]):
-        # Caso raro: chamada caiu na coluna 1
-        m_chamada = re.match(r"^(\d{1,3})$", cels[1])
-        chamada_col = 1
-    else:
-        chamada_col = 0
-
-    if not m_chamada:
+    # A partir daqui, c0 precisa ser apenas a chamada (1-3 dígitos)
+    m0 = re.match(r"^(\d{1,3})$", c0)
+    if not m0:
         return None, None
 
-    # A partir da chamada, procura a matrícula (5-6 dígitos) nas próximas células
-    for j in range(chamada_col + 1, min(chamada_col + 4, len(cels))):
-        c = cels[j]
-        # Formato A/B/D: matrícula pura
-        m = re.match(r"^(\d{5,6})$", c)
-        if m:
-            # Nome pode estar na próxima célula
-            nome = cels[j + 1] if j + 1 < len(cels) else ""
-            return m.group(1), nome
-        # Formato C: "142813 NOME COMPLETO"
-        m = re.match(r"^(\d{5,6})\s+(.+)$", c)
-        if m:
-            return m.group(1), m.group(2).strip()
-        # Formato combinado: "001 142813" na própria célula
-        m = re.match(r"^\d{1,3}\s+(\d{5,6})$", c)
-        if m:
-            nome = cels[j + 1] if j + 1 < len(cels) else ""
-            return m.group(1), nome
+    # Formato A: c1 = "142813" puro
+    m1 = re.match(r"^(\d{5,6})$", c1)
+    if m1:
+        return m1.group(1), c2
+
+    # Formato C: c1 = "142813 NOME"
+    m1 = re.match(r"^(\d{5,6})\s+(.+)$", c1)
+    if m1:
+        return m1.group(1), m1.group(2).strip()
+
+    # Formato D: c1 vazio, c2 = "142813"
+    m2 = re.match(r"^(\d{5,6})$", c2)
+    if m2:
+        return m2.group(1), c3
 
     return None, None
 
@@ -235,9 +224,9 @@ def extrair_tabela_notas(df_bruto):
 
 def eh_tabela_de_notas(df_bruto):
     """
-    Detecção relaxada:
-      1) Se tem >= 2 marcadores de cabeçalho conhecidos: aceita.
-      2) Senão, se tem >= 5 matrículas únicas (5-6 dígitos) E >= 20 notas XX.XX: aceita.
+    Aceita como tabela de notas se:
+      1) Tem >= 2 marcadores de cabeçalho conhecidos; OU
+      2) Tem >= 10 matrículas únicas (5-6 dígitos) — heurística forte.
     """
     texto = " ".join(str(v) for v in df_bruto.values.flatten()).upper()
     texto_norm = re.sub(r"\s+", "", texto)
@@ -247,10 +236,8 @@ def eh_tabela_de_notas(df_bruto):
     if sum(1 for m in marcadores if m in texto_norm) >= 2:
         return True
 
-    # Fallback estrutural
     matriculas = set(re.findall(r"\b\d{5,6}\b", texto))
-    notas_xx = re.findall(r"\b\d{2}\.\d{2}\b", texto)
-    if len(matriculas) >= 5 and len(notas_xx) >= 20:
+    if len(matriculas) >= 10:
         return True
 
     return False
@@ -280,9 +267,9 @@ def _tentar_flavor(tmp_path: str, **kwargs):
             if idx_header is not None:
                 break
 
-        eh_tab = eh_tabela_de_notas(df)
         texto = " ".join(str(v) for v in df.values.flatten())
         n_matriculas = len(set(re.findall(r"\b\d{5,6}\b", texto)))
+        eh_tab = eh_tabela_de_notas(df)
 
         tabelas_info.append({
             "indice": i,
@@ -329,7 +316,6 @@ def processar_pdf(pdf_bytes: bytes) -> dict:
                 except Exception as e:
                     debug[label] = {"erro": str(e), "notas": {}, "tabelas": [], "n_notas_max": 0}
 
-        # Escolhe o flavor com MAIS alunos (desempate: mais colunas de notas)
         opcoes = [
             (label, len(d.get("notas", {})), d.get("n_notas_max", 0), d.get("notas", {}))
             for label, d in debug.items() if d.get("notas")
@@ -354,15 +340,12 @@ def depurar_pdf(pdf_bytes: bytes) -> dict:
 
 
 def encontrar_aluno(notas: dict, matricula: str, nome: str):
-    """Procura por matrícula exata, flexível e por nome normalizado."""
     if matricula in notas:
         return notas[matricula]
-
     mat_limpa = matricula.lstrip("0")
     for m, n in notas.items():
         if m.lstrip("0") == mat_limpa:
             return n
-
     nome_norm = normalizar_nome(nome)
     if not nome_norm:
         return None
